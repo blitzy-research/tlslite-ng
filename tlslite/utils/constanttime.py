@@ -81,6 +81,39 @@ def ct_isnonzero_u32(val):
     return (val|(-val&0xffffffff)) >> 31
 
 
+def ct_nonzero_u8(val):
+    """
+    Returns 1 if val is != 0, 0 otherwise. Constant time, 8 bit domain.
+
+    :type val: int
+    :param val: an unsigned integer representable as an 8 bit value
+    :rtype: int
+
+    Byte domain counterpart of ct_isnonzero_u32(); a byte comparison is
+    spelled ct_nonzero_u8(a ^ b).
+
+    It exists rather than reusing ct_isnonzero_u32() because every
+    intermediate of the fold below stays within 0-255, and so inside the
+    range of small integers CPython keeps as cached singletons, so no
+    arbitrary precision integer is allocated for any input. Masking a
+    negation to 32 bits cannot do that: it allocates a fresh multi digit
+    integer for a non-zero operand and none at all for zero, making the
+    cost depend on the very value it is meant to hide. That asymmetry is
+    harmless on public data, which is why the 32 bit primitives are left
+    unchanged, but it must be avoided when the operand is secret.
+
+    Uniform allocation is a property of CPython, never a correctness
+    dependency: the result is 1 for a non-zero byte and 0 for a zero byte
+    on any conforming Python implementation. As SECURITY.md explains,
+    pure python cannot guarantee absolute constant time, so this narrows
+    the measurable leak rather than removing it.
+    """
+    val |= val >> 4
+    val |= val >> 2
+    val |= val >> 1
+    return val & 1
+
+
 def ct_neq_u32(val_a, val_b):
     """
     Return 1 if val_a != val_b, 0 otherwise. Constant time.
