@@ -90,7 +90,8 @@ def ct_nonzero_u8(val):
     :rtype: int
 
     Byte domain counterpart of ct_isnonzero_u32(); a byte comparison is
-    spelled ct_nonzero_u8(a ^ b).
+    spelled ct_nonzero_u8(a ^ b). Prefer it over ct_isnonzero_u32() and
+    ct_neq_u32() whenever the operand is secret.
 
     It exists rather than reusing ct_isnonzero_u32() because every
     intermediate of the fold below stays within 0-255, and so inside the
