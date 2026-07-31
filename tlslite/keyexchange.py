@@ -535,24 +535,16 @@ class RSAKeyExchange(KeyExchange):
         # On decryption failure randomize premaster secret to avoid
         # Bleichenbacher's "million message" attack
         randomPreMasterSecret = getRandomBytes(48)
-        # decrypt() reports failure with None only for a publicly invalid
-        # ciphertext: one whose length doesn't match the modulus or that
-        # encodes an integer not smaller than it. The peer already knows
-        # both facts about the message it sent, so acting on them with a
-        # branch is not an oracle. Note the deliberate tightening: this used
-        # to be a truthiness test, which also caught the empty bytearray
-        # that decrypt() is documented to return for a validly encrypted
-        # empty message; such a plaintext now reaches the branch-free length
-        # check below, which substitutes the random value for it exactly as
-        # the truthiness test did.
+        # None denotes only publicly invalid ciphertexts: ones whose
+        # length doesn't match the modulus or that encode an integer not
+        # smaller than it. An empty bytearray is a valid decrypted value
+        # and must reach the uniform length check below.
         if premasterSecret is None:
             premasterSecret = randomPreMasterSecret
 
-        # Everything below is branch-free by design: the sequence of
-        # executed operations must not depend on whether the PKCS#1 v1.5
-        # padding was well formed nor on the structure of the recovered
-        # plaintext, as that difference is the very oracle Bleichenbacher's
-        # attack needs. Do not "simplify" it back into a cascade of ifs.
+        # Keep the secret-derived checks branch-free so that padding
+        # validity and plaintext structure do not change the Python-level
+        # control flow.
 
         # Normalising the candidate keeps it indexable: its first 48 bytes
         # followed by the 48 random ones are at least 48 bytes long whatever
@@ -572,8 +564,8 @@ class RSAKeyExchange(KeyExchange):
         client_version = self.clientHello.client_version
         server_version = self.serverHello.server_version
 
-        # Fold the three rejection conditions through one shared loop so
-        # that none of them is cheaper to evaluate than the others:
+        # Evaluate all three rejection conditions unconditionally and
+        # normalise each with the same byte-domain fold:
         # bit 2 - the plaintext isn't exactly 48 bytes long
         # bit 1 - it doesn't carry the version from Client Hello
         # bit 0 - it doesn't carry the version from Server Hello

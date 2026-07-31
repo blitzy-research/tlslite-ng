@@ -25,20 +25,20 @@ whether the padding was well formed, nor on the length or the two leading
 version bytes of the recovered plaintext. When the padding does not check out
 it still substitutes a deterministically derived synthetic plaintext, the
 behaviour RFC 5246 section 7.4.7.1 requires of a TLS server that receives an
-incorrectly formatted premaster secret. The number of Python operations
-executed while de-padding is now identical for every secret-dependent class
-of input, and the test suite asserts that equality rather than taking it on
-trust.
+incorrectly formatted premaster secret. The Python-level path is structured
+to keep the same control-flow shape for all secret-dependent input classes.
 
 This is timing hardening, **NOT** an absolute constant-time guarantee, so the
 residual is described here rather than left implicit. Because the public RSA
 decryption call is documented to return a variable-length buffer, the copy
 that produces it and the later truncation to 48 bytes are each a single
-variable-size copy below the Python level, of at most a few hundred bytes;
-with CPython's allocator behaviour, garbage collection and ordinary
-interpreter jitter that leaves a sub-microsecond residual which pure Python
-cannot remove. It is far below the leak that has been closed and below the
-noise floor of a realistic network observer, but it is **not zero**.
+variable-size copy below the Python level, and those copy sizes scale with
+the RSA modulus and with the recovered value. Together with CPython's
+allocator behaviour, garbage collection and ordinary interpreter jitter they
+leave a residual which pure Python cannot remove. Measurements for the key
+sizes evaluated here found that residual to be sub-microsecond, but its
+magnitude depends on the key size, the interpreter, the allocator, the
+hardware and the path it is observed over, and it is **not zero**.
 Decryption also still reports an error immediately when the ciphertext is the
 wrong length for the modulus or encodes an integer that is not smaller than
 it; that early exit is deliberate and is not an oracle, because whoever sent

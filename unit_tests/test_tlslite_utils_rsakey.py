@@ -4162,15 +4162,14 @@ ea90adcf1afd52424d02228189fe4c3603134ce07f72994bdd929cc5a2a4
 
 
 class TestRSADepaddingProbeClasses(unittest.TestCase):
-    """Output equivalence of RSA de-padding across every oracle probe class.
+    """Value equivalence across the RSA de-padding probe classes.
 
-    The probes that a differential Bleichenbacher tool sends to a TLS
-    server are generated programmatically here (PKCS#1 conformant, a
-    premaster secret of an unexpected size, no null separator, a null byte
-    among the mandatory padding bytes, a null byte later in the padding, a
+    The probe blocks are generated programmatically (PKCS#1 conformant, a
+    payload of an unexpected size, no null separator, a null byte among
+    the mandatory padding bytes, a null byte later in the padding, a
     corrupted leading byte, a corrupted type byte and a publicly invalid
     ciphertext) and the exact value returned by decrypt() is asserted for
-    every one of them.  Hardening the de-padding path must not change any
+    each of them.  Hardening the de-padding path must not change any
     value, and this class is what pins that.
 
     The expected implicitly rejected (synthetic) plaintexts are re-derived
@@ -4180,11 +4179,9 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
     also catches a change to the key derivation key or to the labels of
     the pseudo random function.
 
-    Uniformity of the executed operation sequence is a separate concern,
-    asserted in unit_tests/test_tlslite_rsa_depadding_uniformity.py by
-    counting executed line events.  Neither module measures wall clock
-    time: durations are not reproducible under a test runner, so timing
-    assertions are deliberately absent from both.
+    This class checks values only.  Operation-sequence checks are a
+    separate concern, and no wall clock timing is asserted here: durations
+    are not reproducible under a test runner.
     """
 
     # A throwaway 2048 bit RSA key, generated for this module and used
@@ -4339,8 +4336,9 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
 
             msg = self.priv_key.decrypt(ciphertext)
 
-            # RFC 5246 section 7.4.7.1 calls for uniform failure: an
-            # incorrectly formatted padding is not reported, it is replaced
+            # RFC 5246 section 7.4.7.1 calls for uniform failure: invalid
+            # padding returns a synthetic plaintext rather than reporting
+            # a distinct error
             self.assertIsNotNone(msg, "%s: decrypt() returned None" % name)
             self.assertIsInstance(msg, bytearray,
                                   "%s: unexpected return type" % name)
