@@ -429,12 +429,12 @@ class RSAKey(object):
         is of incorrect length or encodes an integer bigger than the modulus
         of the key (i.e. it's publically invalid).
 
-        Note: the de-padding performs a fixed sequence of operations, with
-        loop trip counts that depend only on the size of the modulus, so the
-        processing time does not depend on whether the padding was well
-        formed nor on the structure of the recovered plaintext. Selection
-        between the recovered message and the deterministically derived
-        synthetic one is performed with bit masking, not with branches.
+        Note: de-padding uses fixed public-width loops and masked
+        selection, so Python-level control flow does not depend on padding
+        validity or on the structure of the recovered plaintext.
+        Pure-Python allocation, copying, garbage collection and interpreter
+        effects remain; this is timing hardening, not an absolute
+        constant-time guarantee.
 
         :type encBytes: bytes-like object
         :param encBytes: The value which will be decrypted.
@@ -467,19 +467,10 @@ class RSAKey(object):
         # see:
         # https://securitypitfalls.wordpress.com/2018/08/03/constant-time-compare-in-python/
         #
-        # The leaks we can control have been removed: no loop below has a
-        # trip count that depends on a secret, and no secret operand is fed
-        # to a helper whose cost depends on the magnitude of that operand
-        # (i.e. on how many arbitrary precision digits cPython has to
-        # allocate for it).
-        # What remains is what pure python cannot express away: the variable
-        # size copies implied by the variable length return value (see the
-        # documented return contract above), allocator behaviour, garbage
-        # collection, and interpreter dispatch jitter. That residual is small
-        # for the buffer sizes involved here, but it is NOT zero; it is
-        # disclosed in SECURITY.md rather than hidden. If you require
-        # resistance against side-channel attacks, please use a different
-        # library.
+        # The code below avoids secret-dependent branches, loop counts and
+        # repeated wide-integer work in per-byte validation. Pure-Python
+        # allocation, copying, garbage collection and interpreter effects
+        # remain; this is not an absolute constant-time guarantee.
 
         n = self.n
 
@@ -519,18 +510,19 @@ class RSAKey(object):
                 | len_candidate & mask
 
         synth_msg_start = numBytes(n) - synth_length
+        # split into a high and a low byte, so that selecting between the
+        # synthetic start and the real one below can be done without leaving
+        # the byte domain; see the note on helpers that follows
+        synth_start_hi = synth_msg_start >> 8
+        synth_start_lo = synth_msg_start & 0xff
 
         error_detected = 0
 
-        # a note on which helpers are used below, because it is load bearing:
-        # the ct_*_u32() helpers mask a two's complement negation to 32 bits,
-        # so cPython allocates a fresh multi-digit integer when the operand is
-        # non-zero and reuses a cached small integer when it is zero. Calling
-        # them once per decrypted byte would therefore make the number of
-        # expensive evaluations a function of the plaintext. Every test on a
-        # *secret* byte below uses ct_nonzero_u8() instead: its intermediates
-        # never exceed 255, so they always come from the small integer cache.
-        # Do NOT "simplify" these back to the 32 bit helpers.
+        # secret-dependent checks stay in the byte domain: the 32-bit
+        # zero/inequality helpers and 16-bit mask propagation have
+        # value-dependent allocation costs on CPython. Track offsets as two
+        # bytes and use 8-bit masks; recombine only once when a slice index
+        # is required.
 
         # enumerate over all decrypted bytes
         em_bytes = enumerate(dec_bytes)
@@ -538,19 +530,18 @@ class RSAKey(object):
         _, val = next(em_bytes)
         error_detected |= ct_nonzero_u8(val)
         _, val = next(em_bytes)
-        # ct_nonzero_u8(val ^ 0x02) is the byte domain form of val != 0x02
         error_detected |= ct_nonzero_u8(val ^ 0x02)
         # then look for for the null separator byte among the padding bytes
         # but inspect all decrypted bytes, even if we already find the
         # separator earlier
-        msg_start = 0
-        # single bit flag, set to 1 by the iteration that finds the null
-        # separator; replaces re-deriving that fact from msg_start (a secret)
-        # on every iteration
+        msg_start_hi = 0
+        msg_start_lo = 0
+        # track whether a separator has been selected without testing the
+        # secret-derived message offset on every iteration
         sep_seen = 0
         for pos, val in em_bytes:
-            # pos is the public loop index, so the 32 bit helper is safe on
-            # it; evaluate it just once and reuse it for both checks below
+            # pos is public, so ct_lt_u32() is safe here; compute it once
+            # for both checks
             pos_lt_10 = ct_lt_u32(pos, 10)
             val_is_zero = 1 ^ ct_nonzero_u8(val)
 
@@ -561,19 +552,23 @@ class RSAKey(object):
             #     error_detected = 0x01
             error_detected |= pos_lt_10 & val_is_zero
 
-            # update the msg_start only once; while the separator is unseen
-            # (pos+1) because we want to skip the null separator
-            # equivalent to:
+            # update the message start only once; while the separator is
+            # unseen. (pos+1) because we want to skip the null separator
+            # conceptually (the message start seen as one number):
             # if pos >= 10 and not sep_seen and not val:
             #     msg_start = pos+1
             #     sep_seen = 1
             mask = (1 ^ pos_lt_10) & val_is_zero & (1 ^ sep_seen)
-            # the update of sep_seen must come after mask was computed, so
-            # that the iteration which finds the separator still observes
-            # sep_seen == 0, exactly like msg_start was still 0 there
+            # update sep_seen after deriving mask so the first separator
+            # remains selectable
             sep_seen |= mask
-            sep_mask = ct_lsb_prop_u16(mask)
-            msg_start = msg_start & (0xffff ^ sep_mask) | (pos+1) & sep_mask
+            sep_mask = ct_lsb_prop_u8(mask)
+            # pos is public; split pos+1 before masked selection so the
+            # selected offset stays byte-sized
+            msg_start_hi = msg_start_hi & (0xff ^ sep_mask) \
+                | ((pos+1) >> 8) & sep_mask
+            msg_start_lo = msg_start_lo & (0xff ^ sep_mask) \
+                | ((pos+1) & 0xff) & sep_mask
 
         # if separator wasn't found, it's an error
         # equivalent to:
@@ -581,32 +576,35 @@ class RSAKey(object):
         #     error_detected = 0x01
         error_detected |= 1 ^ sep_seen
 
-        # equivalent to:
+        # the same mask selects the start of the message and the buffer to
+        # return, so propagate the error bit just once
+        mask = ct_lsb_prop_u8(error_detected)
+        not_mask = 0xff ^ mask
+
+        # equivalent to (with the message start seen as one number again):
         # if error_detected:
         #     ret_msg_start = synth_msg_start
         # else:
         #     ret_msg_start = msg_start
-        mask = ct_lsb_prop_u16(error_detected)
-        ret_msg_start = msg_start & (0xffff ^ mask) | synth_msg_start & mask
+        start_hi = msg_start_hi & not_mask | synth_start_hi & mask
+        start_lo = msg_start_lo & not_mask | synth_start_lo & mask
+        # recombine the selected bytes only when the slice index is
+        # required. This one secret-derived wide integer is a remaining
+        # pure-Python timing residual; keeping it out of the per-byte loop
+        # limits value-dependent work.
+        ret_msg_start = (start_hi << 8) | start_lo
 
-        # the *value* of ret_msg_start does not leak whether the padding was
-        # correct: it is either the real message start or the synthetic one,
-        # and the two are indistinguishable to the caller. The *timing* of
-        # the selection below did leak it, though: the masked combine used to
-        # iterate the two already sliced buffers, so its trip count was the
-        # returned length. Combining over the full, public modulus width and
-        # taking the slice only afterwards removes that - the trip count now
-        # depends on numBytes(n) alone. We still need to read both buffers so
-        # that the memory access pattern is preserved (that both buffers are
-        # accessed, not just the one we return).
+        # combine both full-width buffers before slicing. Slicing first
+        # would make the masked loop's trip count depend on the selected
+        # message length; combining first keeps it dependent only on the
+        # public modulus width. Reading both buffers also keeps the access
+        # pattern independent of the selected source.
 
         # equivalent to:
         # if error_detected:
         #     return message_random[ret_msg_start:]
         # else:
         #     return dec_bytes[ret_msg_start:]
-        mask = ct_lsb_prop_u8(error_detected)
-        not_mask = 0xff ^ mask
         combined = bytearray(x & not_mask | y & mask
                              for x, y in zip(dec_bytes, message_random))
 

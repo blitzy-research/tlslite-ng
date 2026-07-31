@@ -9,6 +9,12 @@ try:
 except ImportError:
     import unittest
 
+import ast
+import dis
+import inspect
+import sys
+import textwrap
+
 from tlslite.utils.constanttime import ct_lt_u32, ct_gt_u32, ct_le_u32, \
         ct_lsb_prop_u8, ct_isnonzero_u32, ct_neq_u32, ct_eq_u32, \
         ct_check_cbc_mac_and_pad, ct_compare_digest, ct_lsb_prop_u16, \
@@ -21,7 +27,77 @@ from tlslite.utils.cryptomath import getRandomBytes
 from tlslite.recordlayer import RecordLayer
 import tlslite.utils.tlshashlib as hashlib
 import hmac
-import sys
+
+# int, and on Python 2 also long, spelled without naming long so that
+# this module keeps importing on Python 3
+_INT_TYPES = tuple(set((int, type(2 ** 64))))
+
+# Python 3.8+ parses numeric literals as ast.Constant; older versions
+# use ast.Num
+if sys.version_info >= (3, 8):
+    _NUM_NODES = (ast.Constant,)
+else:
+    _NUM_NODES = (ast.Num,)
+
+# reject calls, conditional control flow and indirection so the helper
+# cannot delegate to a wider primitive or branch on the input
+_BANNED_NODE_NAMES = ("Call", "If", "IfExp", "While", "For", "BoolOp",
+                      "Compare", "UnaryOp", "Attribute", "Subscript",
+                      "Lambda", "ListComp", "SetComp", "DictComp",
+                      "GeneratorExp", "Assert", "Raise", "Try",
+                      "TryExcept", "TryFinally", "With", "Break",
+                      "Continue")
+
+# built with getattr because the set of node classes differs between
+# Python 2 and Python 3
+_BANNED_NODES = tuple(getattr(ast, name) for name in _BANNED_NODE_NAMES
+                      if hasattr(ast, name))
+
+_ALLOWED_OPS = (ast.BitOr, ast.BitAnd, ast.BitXor, ast.RShift)
+
+
+def _literal_value(node):
+    """Return the value of a numeric literal node, portably."""
+    if sys.version_info >= (3, 8):
+        return node.value
+    return node.n
+
+
+def _code_of(func):
+    """Return func's code object on both Python 2 and Python 3.
+
+    Python 3 spells the attribute ``__code__``; the oldest interpreters
+    this project supports may only expose ``func_code``, so fall back to
+    it rather than assuming either spelling exists.
+    """
+    code = getattr(func, "__code__", None)
+    if code is None:
+        code = getattr(func, "func_code", None)
+    return code
+
+
+# output-equivalent insecure fixtures verify that the structural checks
+# reject delegation, wide masking and secret-dependent branching
+def _u32_delegate(val):
+    """Insecure shape: hands a secret byte to a 32 bit primitive."""
+    return ct_isnonzero_u32(val)
+
+
+def _u32_inline(val):
+    """Insecure shape: masks a negation to 32 bits, as ct_*_u32 do."""
+    val &= 0xffffffff
+    return (val | (-val & 0xffffffff)) >> 31
+
+
+def _secret_branch(val):
+    """Insecure shape: branches on the byte it is meant to hide."""
+    val |= val >> 4
+    val |= val >> 2
+    val |= val >> 1
+    if val & 1:
+        return 1
+    return 0
+
 
 class TestContanttime(unittest.TestCase):
 
@@ -102,8 +178,6 @@ class TestContanttime(unittest.TestCase):
         self.assertEqual((i != 0), (ct_nonzero_u8(i) == 1))
 
     def test_ct_nonzero_u8_exhaustive(self):
-        # the byte domain is just 256 values wide, so rather than only
-        # sampling it, enumerate every single input
         for i in range(256):
             res = ct_nonzero_u8(i)
             self.assertEqual(1 if i else 0, res,
@@ -115,51 +189,181 @@ class TestContanttime(unittest.TestCase):
                              "not a plain int for byte value %d" % i)
 
     def test_ct_nonzero_u8_byte_neq(self):
-        # the production call sites express a byte compare as
-        # ct_nonzero_u8(a ^ b), replacing ct_neq_u32(a, b)
         for lhs, rhs in ((0, 0), (0, 2), (2, 2), (0xff, 0xff),
                          (0xf0, 0x02), (2, 0)):
             self.assertEqual(1 if lhs != rhs else 0,
                              ct_nonzero_u8(lhs ^ rhs),
                              "wrong result for %d vs %d" % (lhs, rhs))
 
-    def test_ct_nonzero_u8_byte_domain(self):
-        # This is why ct_nonzero_u8 exists instead of reusing
-        # ct_isnonzero_u32: the 32 bit primitives mask a negation to
-        # 32 bits, so a zero operand keeps every intermediate a small
-        # int while a non-zero one needs a wider, multi digit int. The
-        # count of those wider values then depends on the data. The
-        # fold below never leaves the byte domain, which makes it
-        # allocation uniform on CPython. That is a measurable leak
-        # reduction, not a guarantee of absolute constant time work.
+    # bind structural checks to the real helper: output-only tests would
+    # also accept a wider masked implementation whose allocation cost
+    # depends on the input. These checks reduce CPython timing
+    # variability; they do not establish absolute constant-time behavior.
+
+    @staticmethod
+    def _body_ast(func):
+        """Return func's FunctionDef when source is available, else None."""
+        try:
+            src = inspect.getsource(func)
+        except (IOError, OSError, TypeError):
+            return None
+        return ast.parse(textwrap.dedent(src)).body[0]
+
+    def _assert_code_shape(self, func):
+        """Reject byte code with name lookups, closures, wide constants
+        or jumps.
+        """
+        code = _code_of(func)
+        name = func.__name__
+        # never let a missing code object turn the checks below into a
+        # silent pass
+        self.assertTrue(code is not None,
+                        "no code object available for %s" % name)
+        # with no name lookups at all the function cannot reach
+        # ct_isnonzero_u32(), ct_neq_u32() or any other callable
+        self.assertEqual((), code.co_names,
+                         "%s looks up the global names %r"
+                         % (name, code.co_names))
+        self.assertEqual((), code.co_freevars,
+                         "%s closes over %r" % (name, code.co_freevars))
+        for const in code.co_consts:
+            if isinstance(const, _INT_TYPES):
+                # reject wide mask constants used by value-dependent
+                # multi-digit arithmetic
+                self.assertTrue(0 <= const <= 0xff,
+                                "%s holds the wide constant %r"
+                                % (name, const))
+        # calibrate against a known straight-line helper before treating
+        # jump targets as evidence of branching
+        if not dis.findlabels(_code_of(ct_lsb_prop_u8).co_code):
+            self.assertEqual([], dis.findlabels(code.co_code),
+                             "%s branches" % name)
+
+    def _assert_source_shape(self, func):
+        """Assert func's source is a branch-free byte-domain fold."""
+        node = self._body_ast(func)
+        if node is None:
+            return
+        name = func.__name__
+        arg = _code_of(func).co_varnames[0]
+        returns = 0
+        for item in ast.walk(node):
+            self.assertFalse(isinstance(item, _BANNED_NODES),
+                             "%s uses %s" % (name, type(item).__name__))
+            if isinstance(item, ast.Return):
+                returns += 1
+            if isinstance(item, (ast.BinOp, ast.AugAssign)):
+                self.assertTrue(isinstance(item.op, _ALLOWED_OPS),
+                                "%s uses the operator %s"
+                                % (name, type(item.op).__name__))
+            if isinstance(item, ast.Name):
+                self.assertEqual(arg, item.id,
+                                 "%s references %s" % (name, item.id))
+            if isinstance(item, _NUM_NODES):
+                num = _literal_value(item)
+                if isinstance(num, _INT_TYPES):
+                    self.assertTrue(0 <= num <= 0xff,
+                                    "%s uses the literal %r"
+                                    % (name, num))
+        self.assertEqual(1, returns,
+                         "%s has %d return statements" % (name, returns))
+
+    @staticmethod
+    def _trace_call(func, val):
+        """Call func(val) under tracing.
+
+        Return the result, the local values observed at line events and
+        the executed line numbers.
+        """
+        seen = []
+        lines = []
+        name = _code_of(func).co_varnames[0]
+
+        def local_trace(frame, event, _arg):
+            """Record one event of the traced frame."""
+            if event == "line":
+                lines.append(frame.f_lineno)
+                seen.append(frame.f_locals[name])
+            return local_trace
+
+        def global_trace(frame, event, _arg):
+            """Start recording once the traced function is entered."""
+            if event == "call" and frame.f_code is _code_of(func):
+                return local_trace
+            return None
+
+        outer = sys.gettrace()
+        sys.settrace(global_trace)
+        try:
+            res = func(val)
+        finally:
+            sys.settrace(outer)
+        return res, seen, lines
+
+    def _assert_traced_shape(self, func):
+        """Assert the line sequence and the byte-domain local
+        observations are uniform for all byte inputs.
+        """
         byte_size = sys.getsizeof(0xff)
         wide_size = sys.getsizeof(0xffffffff)
+        first = None
         for i in range(256):
-            # replay the fold step by step, keeping every intermediate
-            val = i
-            steps = [val]
-            val |= val >> 4
-            steps.append(val)
-            val |= val >> 2
-            steps.append(val)
-            val |= val >> 1
-            steps.append(val)
-            steps.append(val & 1)
-            # if the primitive is ever rewritten, this catches the
-            # replay above silently drifting away from it
-            self.assertEqual(ct_nonzero_u8(i), steps[-1],
-                             "replayed fold diverged for value %d" % i)
-            for item in steps:
+            res, seen, lines = self._trace_call(func, i)
+            self.assertEqual(1 if i else 0, res,
+                             "wrong result for byte value %d" % i)
+            # a tracer that never fired would leave the rest of this
+            # loop vacuous, so require the fold's own steps to show up
+            self.assertTrue(len(seen) >= 4,
+                            "only %d traced steps for byte value %d"
+                            % (len(seen), i))
+            for val in seen:
                 # interpreter independent, so always asserted
-                self.assertTrue(0 <= item <= 0xff,
+                self.assertTrue(0 <= val <= 0xff,
                                 "intermediate %d leaves the byte "
-                                "domain for value %d" % (item, i))
+                                "domain for value %d" % (val, i))
                 # CPython specific, so calibrated against this
                 # interpreter rather than a hard coded object size
                 if wide_size > byte_size:
-                    self.assertTrue(sys.getsizeof(item) <= byte_size,
+                    self.assertTrue(sys.getsizeof(val) <= byte_size,
                                     "intermediate %d is wider than a "
-                                    "byte for value %d" % (item, i))
+                                    "byte for value %d" % (val, i))
+            if first is None:
+                first = lines
+            else:
+                self.assertEqual(first, lines,
+                                 "byte value %d executes other lines"
+                                 % i)
+
+    def test_ct_nonzero_u8_real_shape(self):
+        # check the helper itself, not a duplicated model that could drift
+        self._assert_code_shape(ct_nonzero_u8)
+        self._assert_source_shape(ct_nonzero_u8)
+
+    def test_ct_nonzero_u8_traced_steps(self):
+        # verify line-event observations stay byte-sized and every input
+        # executes the same source lines
+        if sys.gettrace() is not None:
+            self.skipTest("another tracer is already installed")
+        self._assert_traced_shape(ct_nonzero_u8)
+
+    def test_ct_nonzero_u8_rejections(self):
+        # output-equivalent insecure fixtures must fail the structural
+        # checks; otherwise the tests would not detect a leaking
+        # implementation shape
+        for func in (ct_isnonzero_u32, _u32_delegate, _u32_inline,
+                     _secret_branch):
+            for i in range(256):
+                self.assertEqual(ct_nonzero_u8(i), func(i),
+                                 "%s is not output equivalent at %d"
+                                 % (func.__name__, i))
+            self.assertRaises(AssertionError,
+                              self._assert_code_shape, func)
+            if self._body_ast(func) is not None:
+                self.assertRaises(AssertionError,
+                                  self._assert_source_shape, func)
+        if sys.gettrace() is None:
+            self.assertRaises(AssertionError,
+                              self._assert_traced_shape, _secret_branch)
 
 class TestContanttimeCBCCheck(unittest.TestCase):
 
