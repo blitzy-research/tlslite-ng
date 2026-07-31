@@ -15,6 +15,10 @@ from tlslite.utils.cryptomath import *
 from tlslite.errors import *
 from tlslite.utils.keyfactory import parsePEMKey, generateRSAKey
 from tlslite.utils.compat import a2b_hex, remove_whitespace
+# the de-padding helpers themselves, and the module whose alias for the
+# byte-domain one the tests below instrument
+from tlslite.utils.constanttime import ct_isnonzero_u32, ct_nonzero_u8
+from tlslite.utils import rsakey as rsakey_module
 try:
     import mock
     from mock import call
@@ -4442,3 +4446,101 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
                                                 self.width * 8)
         self.assertEqual(len(message_random), self.width)
         self.assertEqual(len(calc_lengths(self.priv_key, kdk)), 128)
+
+    # De-padding folds every secret byte with ct_nonzero_u8(), whose
+    # intermediates all stay inside CPython's cached small integer range.
+    # Which helper it folds with is invisible in the values it returns and
+    # invisible in the number of Python lines it executes, so a call site
+    # put back on ct_isnonzero_u32() or ct_neq_u32() would restore the
+    # allocation asymmetry that leaked without failing any of the tests
+    # above.  The three tests that follow instrument the alias
+    # tlslite.utils.rsakey binds and assert what de-padding really called,
+    # what it passed, and that the substitution really is value preserving.
+    # The structural half of the guard - that the alias resolves the real
+    # byte-domain helper and that neither method names a wide one - lives
+    # in test_tlslite_utils_constanttime.
+
+    @staticmethod
+    def _fold_recorder():
+        """Patch the de-padding helper alias with a recording wrapper.
+
+        The wrapper delegates to the real byte-domain helper, so it cannot
+        change any value decrypt() computes; that is what lets the
+        instrumented plaintext be compared against the uninstrumented one.
+        """
+        return mock.patch("tlslite.utils.rsakey.ct_nonzero_u8",
+                          side_effect=ct_nonzero_u8)
+
+    def _assert_byte_domain_folds(self, folds, name):
+        """Assert every recorded fold argument stayed inside a byte.
+
+        Each argument has to be a single value between 0 and 255, which is
+        what keeps the fold's own intermediates inside CPython's cached
+        small integer range - the property that
+        test_ct_nonzero_u8_traced_steps pins for all 256 possible inputs.
+        The range is interpreter independent, so it is asserted
+        everywhere, and no object size is hard coded here.
+        """
+        for args, kwargs in folds.call_args_list:
+            self.assertEqual(kwargs, {}, msg=name)
+            self.assertEqual(len(args), 1, msg=name)
+            self.assertTrue(0 <= args[0] <= 0xff,
+                            "%s: folded %r, which is outside the byte "
+                            "domain" % (name, args[0]))
+
+    def test_every_secret_byte_is_folded_in_the_byte_domain(self):
+        for name, block, _ in self._probes():
+            ciphertext = self._encrypt_block(block)
+            expected = self.priv_key.decrypt(ciphertext)
+
+            with self._fold_recorder() as folds:
+                msg = self.priv_key.decrypt(ciphertext)
+
+            # recording only observes, so no value may move
+            self.assertEqual(msg, expected,
+                             "%s: recording changed the plaintext" % name)
+            # the two prefix bytes and then one fold for each remaining
+            # byte of the decrypted block: every secret byte is folded,
+            # and the number of folds follows the public modulus width
+            # and nothing else
+            self.assertEqual(folds.call_count, self.width,
+                             "%s: %d folds while de-padding a %d byte "
+                             "block" % (name, folds.call_count,
+                                        self.width))
+            self._assert_byte_domain_folds(folds, name)
+
+    def test_publicly_invalid_ciphertext_folds_nothing(self):
+        # the retained early return for a publicly invalid ciphertext is
+        # taken before any secret byte exists, so it folds nothing at all;
+        # that is where the guarded region begins, and it is why the
+        # operation count module keeps this class out of its equivalence
+        # set
+        with self._fold_recorder() as folds:
+            msg = self.priv_key.decrypt(bytearray(self.width - 1))
+
+        self.assertIsNone(msg)
+        self.assertEqual(folds.call_count, 0)
+
+    def test_wide_fold_substitution_changes_no_plaintext(self):
+        # Why the fold count above is worth asserting: ct_isnonzero_u32()
+        # answers exactly as ct_nonzero_u8() does for every byte, so with
+        # it at the same call sites every plaintext stays byte identical
+        # and the executed line count stays the same too.  Neither the
+        # probe matrix above nor the operation count invariant in
+        # test_tlslite_rsa_depadding_uniformity can see the difference -
+        # only instrumenting the call sites can.
+        for name, block, _ in self._probes():
+            ciphertext = self._encrypt_block(block)
+            expected = self.priv_key.decrypt(ciphertext)
+
+            with mock.patch("tlslite.utils.rsakey.ct_nonzero_u8",
+                            side_effect=ct_isnonzero_u32) as wide:
+                msg = self.priv_key.decrypt(ciphertext)
+
+            self.assertEqual(wide.call_count, self.width, msg=name)
+            self.assertEqual(msg, expected,
+                             "%s: the substitution changed the plaintext"
+                             % name)
+
+        # and the alias is the real byte-domain helper again afterwards
+        self.assertIs(rsakey_module.ct_nonzero_u8, ct_nonzero_u8)

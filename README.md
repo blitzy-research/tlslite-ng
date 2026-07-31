@@ -632,11 +632,12 @@ Similarly, while delegated credentials have a valid time option, it is not enfor
   plaintext, and the key exchange handler no longer branches on the
   structure of the premaster secret or on its two leading version bytes, so
   the same sequence of operations runs whether or not the padding was well
-  formed. Nothing observable changes: no API or wire format change, and
-  every ciphertext still decrypts to the same value, the deterministically
-  derived synthetic plaintexts included. As with the earlier workaround this
-  reduces the leak rather than removing the vulnerability class, see
-  SECURITY.md for the residual that pure python leaves behind.
+  formed. The timing profile is the only observable change: there is no
+  API or wire format change, and every ciphertext still decrypts to the
+  same value, the deterministically derived synthetic plaintexts
+  included. As with the earlier workaround this reduces the leak rather
+  than removing the vulnerability class, see SECURITY.md for the residual
+  that pure python leaves behind.
 
 0.8.2 - 2025-01-22
 * additional test vectors for the RSA implicit rejection mechanism

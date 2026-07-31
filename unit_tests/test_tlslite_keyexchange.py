@@ -46,6 +46,10 @@ except ImportError:
 from tlslite.keyexchange import KeyExchange, RSAKeyExchange, \
         DHE_RSAKeyExchange, SRPKeyExchange, ECDHE_RSAKeyExchange, \
         RawDHKeyExchange, FFDHKeyExchange, KEMKeyExchange
+# the premaster secret selection helpers, and the module whose alias for
+# the byte-domain one the tests below instrument
+from tlslite.utils.constanttime import ct_isnonzero_u32, ct_nonzero_u8
+from tlslite import keyexchange as keyexchange_module
 from tlslite.utils.x25519 import x25519, X25519_G, x448, X448_G
 from tlslite.mathtls import RFC7919_GROUPS
 from tlslite.utils.python_key import Python_Key
@@ -1876,6 +1880,157 @@ class TestRSAKeyExchange(unittest.TestCase):
         self.assertIsInstance(dec_premaster, bytearray)
         self.assertEqual(48, len(dec_premaster))
         self.assertEqual(fallback, dec_premaster)
+
+    # The premaster secret selection folds its three rejection conditions
+    # with ct_nonzero_u8(), whose intermediates all stay inside CPython's
+    # cached small integer range.  Which helper it folds with shows up in
+    # no value it returns and in no count of executed Python lines, so a
+    # call site put back on ct_neq_u32() or ct_isnonzero_u32() would
+    # restore the allocation asymmetry that leaked without failing any of
+    # the tests above.  The two tests that follow instrument the alias
+    # tlslite.keyexchange binds and assert what the selection really
+    # called, what it passed, and that such a substitution really is value
+    # preserving.  The structural half of the guard - that the alias
+    # resolves the real byte-domain helper and that neither consumer names
+    # a wide one - lives in test_tlslite_utils_constanttime.
+
+    # bit 2 of the accumulator is the length condition, bit 1 the Client
+    # Hello version and bit 0 the Server Hello version, so every input
+    # folds exactly three times
+    _EXPECTED_FOLDS = 3
+
+    @staticmethod
+    def _fold_recorder():
+        """Patch the premaster helper alias with a recording wrapper.
+
+        The wrapper delegates to the real byte-domain helper, so it cannot
+        change the premaster secret that is selected; that is what lets
+        the instrumented answer be compared against the uninstrumented
+        one.
+        """
+        return mock.patch("tlslite.keyexchange.ct_nonzero_u8",
+                          side_effect=ct_nonzero_u8)
+
+    def _assert_byte_domain_folds(self, folds, name):
+        """Assert every recorded fold argument stayed inside a byte.
+
+        A wrong length, a wrong Client Hello version and a wrong Server
+        Hello version all have to reach the helper as a value between 0
+        and 255: that is what keeps the fold in the byte domain, and it is
+        why the length condition is built from the truncated length rather
+        than from the raw one, which would alias to zero for a long
+        synthetic message.
+        """
+        for args, kwargs in folds.call_args_list:
+            self.assertEqual(kwargs, {}, msg=name)
+            self.assertEqual(1, len(args), msg=name)
+            self.assertTrue(0 <= args[0] <= 0xff,
+                            "%s: folded %r, which is outside the byte "
+                            "domain" % (name, args[0]))
+
+    def _premaster_probes(self):
+        """Return the premaster secret probe classes to fold.
+
+        Every class the branch-free selection has to treat alike: the
+        conformant one, the tolerated Server Hello version, a version
+        matching neither hello, a payload that is not 48 bytes long, one
+        that is far longer than 255 bytes, an empty one, and a publicly
+        invalid ciphertext for which decrypt() answers None.
+        """
+        key_size = numBytes(self.srv_pub_key.n)
+        probes = []
+        for name, major, minor in (("conformant", 3, 3),
+                                   ("server version", 3, 2),
+                                   ("unknown version", 2, 1)):
+            premaster_secret = bytearray(b'\xf0'*48)
+            premaster_secret[0] = major
+            premaster_secret[1] = minor
+            probes.append((name,
+                           self.srv_pub_key.encrypt(premaster_secret)))
+        for length in (0, 47, 117):
+            premaster_secret = bytearray(b'\xf0'*length)
+            probes.append(("length %d" % (length, ),
+                           self.srv_pub_key.encrypt(premaster_secret)))
+        # a publicly invalid ciphertext, the one input for which
+        # decrypt() answers None and the random premaster secret is
+        # substituted before the folds run
+        probes.append(("publicly invalid",
+                       bytearray(key_size - 1)))
+        return probes
+
+    def test_premaster_secret_selection_folds_in_the_byte_domain(self):
+        # Three folds for every input, accepted or turned down alike: a
+        # selection that stopped evaluating a condition, or that reached a
+        # wide helper instead, shows up here as a different count while
+        # every value it returns stays the same.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        for name, enc_premaster in self._premaster_probes():
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+            clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                                  (3, 2))
+            clientKeyExchange.createRSA(enc_premaster)
+
+            with self._patch_random_premaster():
+                with self._fold_recorder() as folds:
+                    dec_premaster = keyExchange.processClientKeyExchange(\
+                                    clientKeyExchange)
+
+            self.assertEqual(self._EXPECTED_FOLDS, folds.call_count,
+                             "%s: %d folds instead of %d"
+                             % (name, folds.call_count,
+                                self._EXPECTED_FOLDS))
+            self._assert_byte_domain_folds(folds, name)
+            # and the method still answers with exactly 48 bytes
+            self.assertIsInstance(dec_premaster, bytearray)
+            self.assertEqual(48, len(dec_premaster), msg=name)
+
+    def test_wide_fold_substitution_changes_no_premaster_secret(self):
+        # Why the fold count above is worth asserting: ct_isnonzero_u32()
+        # answers exactly as ct_nonzero_u8() does for every byte, so with
+        # it at the same call site every premaster secret stays byte
+        # identical - the accepted ones and the turned-down ones alike,
+        # which the patched randomness makes deterministic here. No value
+        # assertion in this class, and no operation count in
+        # test_tlslite_rsa_depadding_uniformity, can see the difference.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        for name, enc_premaster in self._premaster_probes():
+            clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                                  (3, 2))
+            clientKeyExchange.createRSA(enc_premaster)
+
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+            with self._patch_random_premaster():
+                expected = keyExchange.processClientKeyExchange(\
+                           clientKeyExchange)
+
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+            with self._patch_random_premaster():
+                with mock.patch("tlslite.keyexchange.ct_nonzero_u8",
+                                side_effect=ct_isnonzero_u32) as wide:
+                    dec_premaster = keyExchange.processClientKeyExchange(\
+                                    clientKeyExchange)
+
+            self.assertEqual(self._EXPECTED_FOLDS, wide.call_count,
+                             msg=name)
+            self.assertIsInstance(dec_premaster, bytearray)
+            self.assertEqual(48, len(dec_premaster), msg=name)
+            self.assertEqual(expected, dec_premaster,
+                             "%s: the substitution changed the premaster "
+                             "secret" % name)
+
+        # and the alias is the real byte-domain helper again afterwards
+        self.assertIs(keyexchange_module.ct_nonzero_u8, ct_nonzero_u8)
 
 class TestDHE_RSAKeyExchange(unittest.TestCase):
     def setUp(self):
