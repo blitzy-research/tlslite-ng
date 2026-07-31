@@ -17,6 +17,7 @@ from .utils.ecc import getCurveByName, getPointByteSize
 from .utils.rsakey import RSAKey
 from .utils.cryptomath import bytesToNumber, getRandomBytes, powMod, \
         numBits, numberToByteArray, divceil, numBytes, secureHash
+from .utils.constanttime import ct_lsb_prop_u8, ct_nonzero_u8
 from .utils.lists import getFirstMatching
 from .utils import tlshashlib as hashlib
 from .utils.x25519 import x25519, x448, X25519_G, X448_G, X25519_ORDER_SIZE, \
@@ -534,17 +535,69 @@ class RSAKeyExchange(KeyExchange):
         # On decryption failure randomize premaster secret to avoid
         # Bleichenbacher's "million message" attack
         randomPreMasterSecret = getRandomBytes(48)
-        if not premasterSecret:
+        # decrypt() reports failure with None only for a publicly invalid
+        # ciphertext: one whose length doesn't match the modulus or that
+        # encodes an integer not smaller than it. The peer already knows
+        # both facts about the message it sent, so acting on them with a
+        # branch is not an oracle. Note the deliberate tightening: this used
+        # to be a truthiness test, which also caught the empty bytearray
+        # that decrypt() is documented to return for a validly encrypted
+        # empty message; such a plaintext now reaches the branch-free length
+        # check below, which substitutes the random value for it exactly as
+        # the truthiness test did.
+        if premasterSecret is None:
             premasterSecret = randomPreMasterSecret
-        elif len(premasterSecret) != 48:
-            premasterSecret = randomPreMasterSecret
-        else:
-            versionCheck = (premasterSecret[0], premasterSecret[1])
-            if versionCheck != self.clientHello.client_version:
-                #Tolerate buggy IE clients
-                if versionCheck != self.serverHello.server_version:
-                    premasterSecret = randomPreMasterSecret
-        return premasterSecret
+
+        # Everything below is branch-free by design: the sequence of
+        # executed operations must not depend on whether the PKCS#1 v1.5
+        # padding was well formed nor on the structure of the recovered
+        # plaintext, as that difference is the very oracle Bleichenbacher's
+        # attack needs. Do not "simplify" it back into a cascade of ifs.
+
+        # Normalising the candidate keeps it indexable: its first 48 bytes
+        # followed by the 48 random ones are at least 48 bytes long whatever
+        # decrypt() returned, and the appended bytes can only end up
+        # selected when the length is wrong anyway.
+        candidate = premasterSecret[:48]
+        padded = candidate + randomPreMasterSecret
+
+        # ct_nonzero_u8() only folds the low 8 bits of its argument, so a
+        # raw "length ^ 48" would alias to zero for a long synthetic message
+        # (304 ^ 48 == 0x100). The truncated length is 0-48 and the single
+        # byte past position 47 exists only for longer messages, so their
+        # combination is non-zero for every length but 48, all inside the
+        # byte domain and without a comparison.
+        length_diff = (len(candidate) ^ 48) | len(premasterSecret[48:49])
+
+        client_version = self.clientHello.client_version
+        server_version = self.serverHello.server_version
+
+        # Fold the three rejection conditions through one shared loop so
+        # that none of them is cheaper to evaluate than the others:
+        # bit 2 - the plaintext isn't exactly 48 bytes long
+        # bit 1 - it doesn't carry the version from Client Hello
+        # bit 0 - it doesn't carry the version from Server Hello
+        acc = 0
+        for diff in (length_diff,
+                     (padded[0] ^ client_version[0])
+                     | (padded[1] ^ client_version[1]),
+                     (padded[0] ^ server_version[0])
+                     | (padded[1] ^ server_version[1])):
+            acc = (acc << 1) | ct_nonzero_u8(diff)
+
+        # A wrong length always rejects, a wrong version only when it
+        # matches neither hello, because we need to tolerate buggy IE
+        # clients: they send the version from Server Hello instead of the
+        # one from Client Hello. That is why the two version bits are ANDed
+        # rather than ORed.
+        reject = ((acc >> 2) & 1) | (((acc >> 1) & 1) & (acc & 1))
+
+        # Masked selection over a fixed 48 iterations. The result is always
+        # exactly 48 bytes long, which is what keeps the master secret
+        # derivation length-uniform too.
+        mask = ct_lsb_prop_u8(reject)
+        return bytearray(x & (0xff ^ mask) | y & mask
+                         for x, y in zip(padded, randomPreMasterSecret))
 
     def processServerKeyExchange(self, srvPublicKey,
                                  serverKeyExchange):

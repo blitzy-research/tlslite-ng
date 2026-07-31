@@ -4159,3 +4159,288 @@ ea90adcf1afd52424d02228189fe4c3603134ce07f72994bdd929cc5a2a4
         msg = self.priv_key.decrypt(ciphertext)
 
         self.assertEqual(msg, plaintext)
+
+
+class TestRSADepaddingProbeClasses(unittest.TestCase):
+    """Output equivalence of RSA de-padding across every oracle probe class.
+
+    The probes that a differential Bleichenbacher tool sends to a TLS
+    server are generated programmatically here (PKCS#1 conformant, a
+    premaster secret of an unexpected size, no null separator, a null byte
+    among the mandatory padding bytes, a null byte later in the padding, a
+    corrupted leading byte, a corrupted type byte and a publicly invalid
+    ciphertext) and the exact value returned by decrypt() is asserted for
+    every one of them.  Hardening the de-padding path must not change any
+    value, and this class is what pins that.
+
+    The expected implicitly rejected (synthetic) plaintexts are re-derived
+    from the private exponent and the ciphertext with the module level
+    calc_kdk() and calc_lengths() helpers.  Deriving them independently is
+    stronger than checking that the implementation agrees with itself: it
+    also catches a change to the key derivation key or to the labels of
+    the pseudo random function.
+
+    Uniformity of the executed operation sequence is a separate concern,
+    asserted in unit_tests/test_tlslite_rsa_depadding_uniformity.py by
+    counting executed line events.  Neither module measures wall clock
+    time: durations are not reproducible under a test runner, so timing
+    assertions are deliberately absent from both.
+    """
+
+    # A throwaway 2048 bit RSA key, generated for this module and used
+    # nowhere else.  It is kept as integers rather than as PEM so that no
+    # key generation is needed: pure Python key generation has a variable
+    # cost that would be paid on every supported interpreter.
+    p = int(
+        "f61caaf492e9e85ecd0753070850dc3ff264cb455ad35fdf0ec86884670e1dbd"
+        "344405092cf8dbf6935ebb53fabe57f4b812ad97a533983f1bead048b086e6c1"
+        "780c3ff3784b42cb5f1561205d6d2dccb5ad9b3c6ab82f9698f02dc8d86eed8b"
+        "3844abf309b9f4b37a816e92b66be0639bea0d014f0548356b9f8619c8c44523",
+        16)
+    q = int(
+        "c31c777cda2900e16586f565c5ca88dd248028fce2cc48ac46cbf679cb76a74d"
+        "a62fcae244b5af5b69cd0daaab2a07fc325e2aec2547884a9fc45547264003fa"
+        "9af7293c6337076662ae82dc18ed75e0547db929ed8eb7565f9e96d819828657"
+        "6ef081a77ab97961906502f7cca1aebb5ddc526fdd8dd580afcdd3a2fb43cae9",
+        16)
+    n = p * q
+    e = 65537
+
+    @classmethod
+    def setUpClass(cls):
+        cls.priv_key = Python_RSAKey(cls.n, cls.e, 0, cls.p, cls.q)
+        cls.pub_key = Python_RSAKey(cls.n, cls.e)
+        # the decrypted block is always as wide as the modulus, and the
+        # width of the modulus is public information
+        cls.width = numBytes(cls.n)
+
+    @staticmethod
+    def _payload(length):
+        """Return a deterministic payload of the requested length."""
+        # a payload may legitimately contain null bytes, so include some
+        return bytearray((pos * 7 + 3) % 256 for pos in range(length))
+
+    def _conformant_block(self, payload_len):
+        """Build a PKCS#1 v1.5 conformant block with the given payload.
+
+        The layout is a null byte, the type byte 0x02, non-zero padding,
+        the null separator and then the payload.  The separator may not
+        sit before offset 10, as the padding has to be at least 8 bytes
+        long.
+        """
+        block = bytearray(self.width)
+        sep = self.width - payload_len - 1
+        self.assertGreaterEqual(sep, 10)
+        block[0] = 0x00
+        block[1] = 0x02
+        for pos in range(2, sep):
+            # every padding byte has to be non-zero
+            block[pos] = 1 + (pos * 13) % 0xff
+        block[sep] = 0x00
+        block[sep + 1:] = self._payload(payload_len)
+        return block
+
+    def _encrypt_block(self, block):
+        """Turn a crafted block into a ciphertext with the public key."""
+        # encrypt() can only produce conformant padding, so the probes have
+        # to be built by hand and put through the raw public key operation
+        self.assertEqual(len(block), self.width)
+        # a crafted block is only usable while it is smaller than the
+        # modulus; a larger one would be rejected as publicly invalid and
+        # the probe would then exercise the wrong equivalence class
+        self.assertLess(bytesToNumber(block), self.pub_key.n)
+        return self.pub_key._raw_public_key_op_bytes(block)
+
+    def _synthetic_for(self, ciphertext):
+        """Independently derive the implicitly rejected plaintext.
+
+        This repeats the deterministic derivation the mechanism requires:
+        the key derivation key is an HMAC, keyed with the hash of the
+        private exponent, over the ciphertext; the length is the last
+        candidate small enough to be returned; and the message is a full
+        modulus width pseudo random block of which the tail is used.
+        """
+        key = self.priv_key
+        kdk = calc_kdk(key, ciphertext)
+        max_sep_offset = self.width - 10
+        synth_length = 0
+        for candidate in calc_lengths(key, kdk):
+            if candidate < max_sep_offset:
+                synth_length = candidate
+        message_random = key._dec_prf(kdk, b"message", self.width * 8)
+        # the synthetic block is always as wide as the modulus; that public
+        # width is what lets the masked selection run over a fixed length
+        self.assertEqual(len(message_random), self.width)
+        return message_random[self.width - synth_length:]
+
+    def _probes(self):
+        """Return the probe class matrix.
+
+        Every element is a (name, block, separator) tuple, in which the
+        separator is the offset of the null separator that de-padding has
+        to find, or None when the block has to be implicitly rejected.
+        """
+        width = self.width
+        probes = [("PKCS#1 conformant, 48 byte premaster secret",
+                   self._conformant_block(48), width - 49)]
+
+        # "PMS Size = N": a valid padding whose payload is not 48 bytes
+        # long, from empty up to the largest one that fits
+        for length in (0, 2, 47, 200, width - 11):
+            probes.append(("PMS Size = %d" % length,
+                           self._conformant_block(length),
+                           width - length - 1))
+
+        # "0x00 in PKCS Padding": a null byte among the 8 mandatory
+        # padding bytes, which are the ones at offsets 2 to 9
+        for offset in (2, 5, 9):
+            block = self._conformant_block(48)
+            block[offset] = 0x00
+            probes.append(("0x00 in PKCS padding at offset %d" % offset,
+                           block, None))
+
+        # "0x00 in Padding": a null byte in the padding but past the 8
+        # mandatory bytes is not an error at all, it simply becomes an
+        # earlier separator, so the payload starts just after it
+        for offset in (10, 100):
+            block = self._conformant_block(48)
+            block[offset] = 0x00
+            probes.append(("0x00 in padding at offset %d" % offset,
+                           block, offset))
+
+        # "No 0x00 Byte": every byte past the type byte is non-zero, so
+        # there is no separator anywhere in the block
+        block = self._conformant_block(48)
+        for pos in range(2, width):
+            block[pos] = 1 + (pos * 13) % 0xff
+        probes.append(("No 0x00 byte", block, None))
+
+        # a leading byte that is not null; kept small so that the block
+        # still encodes an integer smaller than the modulus
+        block = self._conformant_block(48)
+        block[0] = 0x01
+        probes.append(("first byte not 0x00", block, None))
+
+        block = self._conformant_block(48)
+        block[1] = 0x03
+        probes.append(("type byte not 0x02", block, None))
+
+        return probes
+
+    def test_sanity(self):
+        self.assertEqual(numBits(self.n), 2048)
+        self.assertEqual(self.width, 256)
+        self.assertTrue(self.priv_key.hasPrivateKey())
+        self.assertFalse(self.pub_key.hasPrivateKey())
+
+    def test_probe_class_matrix(self):
+        for name, block, separator in self._probes():
+            ciphertext = self._encrypt_block(block)
+
+            msg = self.priv_key.decrypt(ciphertext)
+
+            # RFC 5246 section 7.4.7.1 calls for uniform failure: an
+            # incorrectly formatted padding is not reported, it is replaced
+            self.assertIsNotNone(msg, "%s: decrypt() returned None" % name)
+            self.assertIsInstance(msg, bytearray,
+                                  "%s: unexpected return type" % name)
+
+            if separator is None:
+                expected = self._synthetic_for(ciphertext)
+            else:
+                expected = block[separator + 1:]
+            self.assertEqual(msg, expected, "%s: wrong plaintext" % name)
+
+    def test_conformant_padding_returns_the_whole_payload(self):
+        block = self._conformant_block(48)
+        ciphertext = self._encrypt_block(block)
+
+        msg = self.priv_key.decrypt(ciphertext)
+
+        self.assertEqual(len(msg), 48)
+        self.assertEqual(msg, block[self.width - 48:])
+
+    def test_valid_padding_to_empty_payload_is_not_an_error(self):
+        # decrypt() documents that an empty bytearray is a valid result,
+        # because encrypting an empty message is correct.  keyexchange.py
+        # relies on that: it tells a failure apart with an "is None" test
+        # rather than by testing for truthiness
+        block = self._conformant_block(0)
+        ciphertext = self._encrypt_block(block)
+
+        msg = self.priv_key.decrypt(ciphertext)
+
+        self.assertIsNotNone(msg)
+        self.assertIsInstance(msg, bytearray)
+        self.assertEqual(msg, bytearray(b''))
+
+    def test_publicly_invalid_ciphertexts_return_none(self):
+        # the length of the ciphertext, and whether it encodes an integer
+        # smaller than the modulus, are things the sender already knows, so
+        # rejecting those outright is not an oracle
+        too_short = bytearray(self.width - 1)
+        too_long = bytearray(self.width + 1)
+        all_ones = bytearray(b'\xff' * self.width)
+        modulus = numberToByteArray(self.n, self.width)
+
+        self.assertGreaterEqual(bytesToNumber(all_ones), self.n)
+        self.assertGreaterEqual(bytesToNumber(modulus), self.n)
+
+        for name, ciphertext in (("too short", too_short),
+                                 ("too long", too_long),
+                                 ("all bits set", all_ones),
+                                 ("equal to the modulus", modulus)):
+            self.assertIsNone(self.priv_key.decrypt(ciphertext),
+                              "%s: expected a rejected ciphertext" % name)
+
+    def test_synthetic_value_is_deterministic(self):
+        # the synthetic plaintext is a deterministic function of the
+        # private exponent and of the ciphertext, so resubmitting a
+        # ciphertext may not produce a different answer; that is what makes
+        # implicit rejection strong
+        block = self._conformant_block(48)
+        block[1] = 0x03
+        ciphertext = self._encrypt_block(block)
+
+        expected = self._synthetic_for(ciphertext)
+
+        first = self.priv_key.decrypt(ciphertext)
+        second = self.priv_key.decrypt(ciphertext)
+        third = self.priv_key.decrypt(ciphertext)
+
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+        self.assertEqual(third, expected)
+
+    def test_synthetic_value_depends_on_the_ciphertext(self):
+        # a constant fallback would be trivial to detect, so different
+        # invalid ciphertexts have to give different synthetic answers
+        seen = []
+        for offset in (2, 3, 4, 5):
+            block = self._conformant_block(48)
+            block[offset] = 0x00
+            ciphertext = self._encrypt_block(block)
+
+            msg = self.priv_key.decrypt(ciphertext)
+
+            self.assertEqual(msg, self._synthetic_for(ciphertext))
+            seen.append(bytes(msg))
+
+        self.assertEqual(len(set(seen)), len(seen))
+
+    def test_full_modulus_width_invariant(self):
+        # the decrypted block and the synthetic block are both exactly as
+        # wide as the modulus, which is public.  That is the premise the
+        # fixed width masked selection in decrypt() rests on
+        block = self._conformant_block(48)
+        ciphertext = self._encrypt_block(block)
+
+        dec = self.priv_key._raw_private_key_op_bytes(ciphertext)
+        self.assertEqual(len(dec), self.width)
+        self.assertEqual(dec, block)
+
+        kdk = calc_kdk(self.priv_key, ciphertext)
+        message_random = self.priv_key._dec_prf(kdk, b"message",
+                                                self.width * 8)
+        self.assertEqual(len(message_random), self.width)
+        self.assertEqual(len(calc_lengths(self.priv_key, kdk)), 128)
