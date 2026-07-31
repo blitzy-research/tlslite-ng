@@ -625,6 +625,18 @@ Similarly, while delegated credentials have a valid time option, it is not enfor
 0.9.0b2 - 2025-09-26
 * support for Delegated Credentials (Ganna Starovoytova)
 * (Experimental) support for ML-DSA certificates in TLS
+* further harden the RSA PKCS#1 v1.5 de-padding path against CVE-2020-26263,
+  the Bleichenbacher oracle in RSA decryption: no loop trip count now
+  follows the recovered message length, the per-byte padding checks no
+  longer do arbitrary precision arithmetic whose cost depends on the secret
+  plaintext, and the key exchange handler no longer branches on the
+  structure of the premaster secret or on its two leading version bytes, so
+  the same sequence of operations runs whether or not the padding was well
+  formed. Nothing observable changes: no API or wire format change, and
+  every ciphertext still decrypts to the same value, the deterministically
+  derived synthetic plaintexts included. As with the earlier workaround this
+  reduces the leak rather than removing the vulnerability class, see
+  SECURITY.md for the residual that pure python leaves behind.
 
 0.8.2 - 2025-01-22
 * additional test vectors for the RSA implicit rejection mechanism
