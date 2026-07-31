@@ -1386,6 +1386,317 @@ class TestRSAKeyExchange(unittest.TestCase):
         premaster_secret[1] = 1
         self.assertNotEqual(dec_premaster, premaster_secret)
 
+    def test_RSA_with_ciphertext_of_wrong_length(self):
+        # A ciphertext whose length differs from the modulus size is
+        # publicly invalid, and RSAKey.decrypt() reports exactly that
+        # with None. None is the only input for which
+        # processClientKeyExchange() substitutes the random premaster
+        # secret before the branch-free selection runs, so this is the
+        # only way to exercise that substitution.
+        # test_RSA_with_invalid_encryption cannot reach it: flipping one
+        # ciphertext bit still leaves a buffer of the right length
+        # encoding an integer below the modulus, so decrypt() answers
+        # with a synthetic message rather than with None.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        key_size = numBytes(self.srv_pub_key.n)
+        self.assertEqual(128, key_size)
+
+        premaster_secret = bytearray(b'\xf0'*48)
+        premaster_secret[0] = 3
+        premaster_secret[1] = 3
+        enc_premaster = self.srv_pub_key.encrypt(premaster_secret)
+        self.assertEqual(key_size, len(enc_premaster))
+
+        for name, malformed in (("truncated", enc_premaster[:-1]),
+                                ("extended",
+                                 enc_premaster + bytearray(1))):
+            # the premise: the length really is wrong and decrypt()
+            # really does report the failure with None
+            self.assertNotEqual(key_size, len(malformed), msg=name)
+            self.assertIsNone(self.srv_private_key.decrypt(malformed),
+                              msg=name)
+
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+            clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                                  (3, 2))
+            clientKeyExchange.createRSA(malformed)
+
+            dec_premaster = keyExchange.processClientKeyExchange(\
+                            clientKeyExchange)
+
+            # uniform failure: no exception, no alert, always 48 bytes
+            self.assertIsNotNone(dec_premaster, msg=name)
+            self.assertIsInstance(dec_premaster, bytearray)
+            self.assertEqual(48, len(dec_premaster), msg=name)
+
+            premaster_secret = bytearray(b'\xf0'*48)
+            premaster_secret[0] = 3
+            premaster_secret[1] = 3
+            self.assertNotEqual(dec_premaster, premaster_secret,
+                                msg=name)
+
+    def test_RSA_with_ciphertext_not_smaller_than_modulus(self):
+        # The second, and last, way of making a ciphertext publicly
+        # invalid: an integer that is not smaller than the modulus. Just
+        # like a wrong length this is a fact the peer already knows about
+        # the message it sent, so the early return in RSAKey.decrypt() is
+        # not an oracle and is deliberately kept as it is.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        key_size = numBytes(self.srv_pub_key.n)
+        modulus = self.srv_pub_key.n
+
+        for name, malformed in (
+                ("all bits set", bytearray(b'\xff'*key_size)),
+                ("exactly the modulus",
+                 numberToByteArray(modulus, key_size))):
+            # the premise: right length, but not below the modulus, so
+            # decrypt() reports the failure with None
+            self.assertEqual(key_size, len(malformed), msg=name)
+            self.assertGreaterEqual(bytesToNumber(malformed), modulus,
+                                    msg=name)
+            self.assertIsNone(self.srv_private_key.decrypt(malformed),
+                              msg=name)
+
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+            clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                                  (3, 2))
+            clientKeyExchange.createRSA(malformed)
+
+            dec_premaster = keyExchange.processClientKeyExchange(\
+                            clientKeyExchange)
+
+            self.assertIsNotNone(dec_premaster, msg=name)
+            self.assertIsInstance(dec_premaster, bytearray)
+            self.assertEqual(48, len(dec_premaster), msg=name)
+            self.assertNotEqual(malformed[:48], dec_premaster, msg=name)
+
+    def test_RSA_with_wrong_size_premaster_secrets(self):
+        # The "PMS Size = N" probe class: the PKCS#1 v1.5 padding is well
+        # formed, so this is not the publicly invalid class, but the
+        # recovered message is not 48 bytes long.
+        # test_RSA_with_wrong_size_premaster covers 47 bytes only, while
+        # a message longer than 48 bytes has to be rejected as well,
+        # even though its first 48 bytes do carry an acceptable version.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        for length in (2, 47, 49, 64, 117):
+            name = "length %d" % (length, )
+            premaster_secret = bytearray(b'\xf0'*length)
+            premaster_secret[0] = 3
+            premaster_secret[1] = 3
+            enc_premaster = self.srv_pub_key.encrypt(premaster_secret)
+            # the premise: decrypt() recovers the message verbatim, so
+            # only its length can be the reason it gets rejected
+            self.assertEqual(premaster_secret,
+                             self.srv_private_key.decrypt(enc_premaster),
+                             msg=name)
+
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+            clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                                  (3, 2))
+            clientKeyExchange.createRSA(enc_premaster)
+
+            dec_premaster = keyExchange.processClientKeyExchange(\
+                            clientKeyExchange)
+
+            self.assertIsInstance(dec_premaster, bytearray)
+            self.assertEqual(48, len(dec_premaster), msg=name)
+            self.assertNotEqual(premaster_secret[:48], dec_premaster,
+                                msg=name)
+
+    def test_RSA_with_empty_premaster_secret(self):
+        # Encrypting an empty message is correct PKCS#1 v1.5, so
+        # decrypt() answers with an empty bytearray for it and not with
+        # None. That is the case which separates the explicit "is None"
+        # test in processClientKeyExchange() from the truthiness test it
+        # replaced: an empty plaintext is a successfully decrypted
+        # message, so it has to be turned down by the branch-free length
+        # check and not by the publicly invalid branch. Either way the
+        # observable result is the same 48 bytes.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        enc_premaster = self.srv_pub_key.encrypt(bytearray(0))
+
+        # the premise: an empty bytearray, which is falsy but is not None
+        dec_empty = self.srv_private_key.decrypt(enc_premaster)
+        self.assertIsNotNone(dec_empty)
+        self.assertEqual(bytearray(0), dec_empty)
+
+        clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                              (3, 2))
+        clientKeyExchange.createRSA(enc_premaster)
+
+        dec_premaster = self.keyExchange.processClientKeyExchange(\
+                        clientKeyExchange)
+
+        self.assertIsNotNone(dec_premaster)
+        self.assertIsInstance(dec_premaster, bytearray)
+        self.assertEqual(48, len(dec_premaster))
+        self.assertNotEqual(bytearray(0), dec_premaster)
+
+    def test_RSA_with_unknown_version_in_premaster(self):
+        # Negative control for
+        # test_RSA_with_server_version_in_premaster_is_tolerated: a
+        # version matching neither Client Hello (3, 3) nor Server Hello
+        # (3, 2) still has to be turned down, which is what proves the
+        # tolerance below is not vacuous.
+        # test_RSA_with_wrong_version only corrupts the minor byte, so an
+        # implementation folding just one of the two version bytes would
+        # pass it; the "major byte wrong" case here catches that.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        for name, major, minor in (("both bytes wrong", 2, 1),
+                                   ("major byte wrong", 2, 3),
+                                   ("minor byte wrong", 3, 4)):
+            premaster_secret = bytearray(b'\xf0'*48)
+            premaster_secret[0] = major
+            premaster_secret[1] = minor
+            clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                                  (3, 2))
+            clientKeyExchange.createRSA(
+                self.srv_pub_key.encrypt(premaster_secret))
+
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+
+            dec_premaster = keyExchange.processClientKeyExchange(\
+                            clientKeyExchange)
+
+            premaster_secret = bytearray(b'\xf0'*48)
+            premaster_secret[0] = major
+            premaster_secret[1] = minor
+            self.assertIsInstance(dec_premaster, bytearray)
+            self.assertEqual(48, len(dec_premaster), msg=name)
+            self.assertNotEqual(dec_premaster, premaster_secret,
+                                msg=name)
+
+    def test_RSA_with_server_version_in_premaster_is_tolerated(self):
+        # Client Hello advertises (3, 3) while Server Hello selects
+        # (3, 2), and buggy Internet Explorer clients copy the Server
+        # Hello version into the premaster secret instead of the Client
+        # Hello one. Tolerating that has to survive the branch-free
+        # rewrite, which spells the decision out as
+        #     reject = length_bad | (client_version_bad & server_version_bad)
+        # A failure here means the AND/OR structure got inverted: ORing
+        # the two version conditions turns this premaster secret down
+        # together with the conformant one, while ANDing the length
+        # condition in stops wrong lengths being turned down at all.
+        # test_RSA_with_wrong_version_in_IE pins the same tolerance;
+        # this test re-pins it and adds the 48 byte invariant.
+        self.assertEqual((3, 3), self.client_hello.client_version)
+        self.assertEqual((3, 2), self.server_hello.server_version)
+
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        premaster_secret = bytearray(b'\xf0'*48)
+        premaster_secret[0] = 3
+        premaster_secret[1] = 2
+        clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                              (3, 2))
+        clientKeyExchange.createRSA(
+            self.srv_pub_key.encrypt(premaster_secret))
+
+        dec_premaster = self.keyExchange.processClientKeyExchange(\
+                        clientKeyExchange)
+
+        premaster_secret = bytearray(b'\xf0'*48)
+        premaster_secret[0] = 3
+        premaster_secret[1] = 2
+        self.assertIsInstance(dec_premaster, bytearray)
+        self.assertEqual(48, len(dec_premaster))
+        self.assertEqual(dec_premaster, premaster_secret)
+
+    def test_RSA_premaster_secret_is_always_48_bytes(self):
+        # The 48 byte result is structural rather than cosmetic: it is
+        # what keeps calcMasterSecret() length uniform, and so the reason
+        # the timing fix does not have to propagate into mathtls.py or
+        # tlsconnection.py. Walk the whole probe taxonomy a
+        # Bleichenbacher attack would use and assert the invariant holds
+        # on every one of them, accepted or turned down, and that none of
+        # them raises - an exception would itself be an error path an
+        # attacker could tell apart, so a new oracle.
+        self.assertIsNone(self.keyExchange.makeServerKeyExchange())
+
+        key_size = numBytes(self.srv_pub_key.n)
+
+        conformant = bytearray(b'\xf0'*48)
+        conformant[0] = 3
+        conformant[1] = 3
+        buggy_ie = bytearray(b'\xf0'*48)
+        buggy_ie[0] = 3
+        buggy_ie[1] = 2
+        unknown = bytearray(b'\xf0'*48)
+        unknown[0] = 3
+        unknown[1] = 1
+        too_short = bytearray(b'\xf0'*47)
+        too_short[0] = 3
+        too_short[1] = 3
+        too_long = bytearray(b'\xf0'*49)
+        too_long[0] = 3
+        too_long[1] = 3
+
+        # corrupting the last byte keeps the length and stays below the
+        # modulus, so this reaches the de-padding failure rather than the
+        # publicly invalid early return
+        corrupted = self.srv_pub_key.encrypt(conformant)
+        corrupted[-1] ^= 0x01
+
+        # third element is the value that has to come back verbatim, or
+        # None when the premaster secret has to be turned down
+        for name, enc_premaster, accepted in (
+                ("conformant",
+                 self.srv_pub_key.encrypt(conformant),
+                 bytearray(conformant)),
+                ("server version, buggy IE",
+                 self.srv_pub_key.encrypt(buggy_ie),
+                 bytearray(buggy_ie)),
+                ("unknown version",
+                 self.srv_pub_key.encrypt(unknown), None),
+                ("premaster secret too short",
+                 self.srv_pub_key.encrypt(too_short), None),
+                ("premaster secret too long",
+                 self.srv_pub_key.encrypt(too_long), None),
+                ("empty premaster secret",
+                 self.srv_pub_key.encrypt(bytearray(0)), None),
+                ("corrupted padding", corrupted, None),
+                ("ciphertext of wrong length",
+                 self.srv_pub_key.encrypt(conformant)[:-1], None),
+                ("ciphertext not below the modulus",
+                 bytearray(b'\xff'*key_size), None)):
+            keyExchange = RSAKeyExchange(self.cipher_suite,
+                                         self.client_hello,
+                                         self.server_hello,
+                                         self.srv_private_key)
+            clientKeyExchange = ClientKeyExchange(self.cipher_suite,
+                                                  (3, 2))
+            clientKeyExchange.createRSA(enc_premaster)
+
+            dec_premaster = keyExchange.processClientKeyExchange(\
+                            clientKeyExchange)
+
+            self.assertIsNotNone(dec_premaster, msg=name)
+            self.assertIsInstance(dec_premaster, bytearray)
+            self.assertEqual(48, len(dec_premaster), msg=name)
+
+            if accepted is None:
+                self.assertNotEqual(conformant, dec_premaster, msg=name)
+                self.assertNotEqual(buggy_ie, dec_premaster, msg=name)
+            else:
+                self.assertEqual(accepted, dec_premaster, msg=name)
+
 class TestDHE_RSAKeyExchange(unittest.TestCase):
     def setUp(self):
         self.srv_private_key = parsePEMKey(srv_raw_key, private=True)

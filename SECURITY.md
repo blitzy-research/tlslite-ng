@@ -16,6 +16,38 @@ information and all pure python cipher implementations will leak timing
 information. None of the included cipher implementations are written in a way
 that even tries to hide the data dependance.
 
+The RSA PKCS#1 v1.5 decryption path has been hardened further against the
+Bleichenbacher-style padding oracle tracked as CVE-2020-26263. De-padding no
+longer branches on secret data, no longer exits early inside the
+secret-dependent region, and no longer runs loops whose trip count is derived
+from a secret, so the sequence of operations it performs does not depend on
+whether the padding was well formed, nor on the length or the two leading
+version bytes of the recovered plaintext. When the padding does not check out
+it still substitutes a deterministically derived synthetic plaintext, the
+behaviour RFC 5246 section 7.4.7.1 requires of a TLS server that receives an
+incorrectly formatted premaster secret. The number of Python operations
+executed while de-padding is now identical for every secret-dependent class
+of input, and the test suite asserts that equality rather than taking it on
+trust.
+
+This is timing hardening, **NOT** an absolute constant-time guarantee, so the
+residual is described here rather than left implicit. Because the public RSA
+decryption call is documented to return a variable-length buffer, the copy
+that produces it and the later truncation to 48 bytes are each a single
+variable-size copy below the Python level, of at most a few hundred bytes;
+with CPython's allocator behaviour, garbage collection and ordinary
+interpreter jitter that leaves a sub-microsecond residual which pure Python
+cannot remove. It is far below the leak that has been closed and below the
+noise floor of a realistic network observer, but it is **not zero**.
+Decryption also still reports an error immediately when the ciphertext is the
+wrong length for the modulus or encodes an integer that is not smaller than
+it; that early exit is deliberate and is not an oracle, because whoever sent
+the message already knows both facts about it. That uniformity also relies on
+CPython caching small integers as singletons, the same interpreter behaviour
+described above, so the residual timing profile may differ on other Python
+implementations, which our CI does not exercise; the functional result is
+identical on any conforming Python, only the timing profile would differ.
+
 In other words, pure-python (tlslite-ng internal) implementations of all
 ciphers, as well as all CBC mode ciphers working in MAC-then-encrypt mode are
 **NOT** secure. Don't use them. In addition to that, use AEAD ciphersuites
