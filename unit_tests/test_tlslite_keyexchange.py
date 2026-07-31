@@ -46,8 +46,8 @@ except ImportError:
 from tlslite.keyexchange import KeyExchange, RSAKeyExchange, \
         DHE_RSAKeyExchange, SRPKeyExchange, ECDHE_RSAKeyExchange, \
         RawDHKeyExchange, FFDHKeyExchange, KEMKeyExchange
-# the premaster secret selection helpers, and the module whose alias for
-# the byte-domain one the tests below instrument
+# Import the selection helpers and consumer module so tests can instrument
+# its bound byte-domain alias.
 from tlslite.utils.constanttime import ct_isnonzero_u32, ct_nonzero_u8
 from tlslite import keyexchange as keyexchange_module
 from tlslite.utils.x25519 import x25519, X25519_G, x448, X448_G
@@ -1390,14 +1390,10 @@ class TestRSAKeyExchange(unittest.TestCase):
         premaster_secret[1] = 1
         self.assertNotEqual(dec_premaster, premaster_secret)
 
-    # The tests below replace the random premaster secret that
-    # processClientKeyExchange() falls back to with a distinctive
-    # constant, so that a turned-down input can be pinned to the value
-    # the masked selection is supposed to pick. Asserting only that the
-    # result differs from the submitted payload is not enough: the
-    # method always answers with 48 bytes, so such an assertion is
-    # vacuously true for a 2 or a 47 byte payload, and 48 zero bytes
-    # from a broken selector would satisfy it for a 48 byte one.
+    # Replace the random fallback with a distinctive deterministic buffer
+    # so rejected inputs can be checked against the exact value selected.
+    # Mere inequality is vacuous for short payloads and would also accept
+    # a broken all-zero selector.
     def _fallback_premaster(self):
         # 48 distinct non-zero bytes, so a permuted or half selected
         # buffer is caught too, opening with (0x80, 0x81) - neither the
@@ -1442,8 +1438,6 @@ class TestRSAKeyExchange(unittest.TestCase):
         for name, malformed in (("truncated", enc_premaster[:-1]),
                                 ("extended",
                                  enc_premaster + bytearray(1))):
-            # the premise: the length really is wrong and decrypt()
-            # really does report the failure with None
             self.assertNotEqual(key_size, len(malformed), msg=name)
             self.assertIsNone(self.srv_private_key.decrypt(malformed),
                               msg=name)
@@ -1461,8 +1455,6 @@ class TestRSAKeyExchange(unittest.TestCase):
                 dec_premaster = keyExchange.processClientKeyExchange(\
                                 clientKeyExchange)
 
-            # uniform method behaviour: no exception and always a 48 byte
-            # result
             self.assertIsNotNone(dec_premaster, msg=name)
             self.assertIsInstance(dec_premaster, bytearray)
             self.assertEqual(48, len(dec_premaster), msg=name)
@@ -1495,8 +1487,6 @@ class TestRSAKeyExchange(unittest.TestCase):
                 ("all bits set", bytearray(b'\xff'*key_size)),
                 ("exactly the modulus",
                  numberToByteArray(modulus, key_size))):
-            # the premise: right length, but not below the modulus, so
-            # decrypt() reports the failure with None
             self.assertEqual(key_size, len(malformed), msg=name)
             self.assertGreaterEqual(bytesToNumber(malformed), modulus,
                                     msg=name)
@@ -1537,8 +1527,6 @@ class TestRSAKeyExchange(unittest.TestCase):
             premaster_secret[0] = 3
             premaster_secret[1] = 3
             enc_premaster = self.srv_pub_key.encrypt(premaster_secret)
-            # the premise: decrypt() recovers the message verbatim, so
-            # only its length can be the reason it gets rejected
             self.assertEqual(premaster_secret,
                              self.srv_private_key.decrypt(enc_premaster),
                              msg=name)
@@ -1578,7 +1566,6 @@ class TestRSAKeyExchange(unittest.TestCase):
 
         enc_premaster = self.srv_pub_key.encrypt(bytearray(0))
 
-        # the premise: an empty bytearray, which is falsy but is not None
         dec_empty = self.srv_private_key.decrypt(enc_premaster)
         self.assertIsNotNone(dec_empty)
         self.assertEqual(bytearray(0), dec_empty)
@@ -1850,7 +1837,6 @@ class TestRSAKeyExchange(unittest.TestCase):
             __nonzero__ = __bool__
 
         recovered = NoBoolBytearray()
-        # the premises: empty, not None, and the trap really is armed
         self.assertEqual(0, len(recovered))
         self.assertIsNotNone(recovered)
         self.assertRaises(AssertionError, bool, recovered)
@@ -1872,8 +1858,6 @@ class TestRSAKeyExchange(unittest.TestCase):
             dec_premaster = keyExchange.processClientKeyExchange(\
                             clientKeyExchange)
 
-        # no coercion happened, and the empty plaintext was turned down by
-        # the branch-free length check
         private_key.decrypt.assert_called_once_with(
             clientKeyExchange.encryptedPreMasterSecret)
         random_bytes.assert_called_once_with(48)
@@ -1881,18 +1865,14 @@ class TestRSAKeyExchange(unittest.TestCase):
         self.assertEqual(48, len(dec_premaster))
         self.assertEqual(fallback, dec_premaster)
 
-    # The premaster secret selection folds its three rejection conditions
-    # with ct_nonzero_u8(), whose intermediates all stay inside CPython's
-    # cached small integer range.  Which helper it folds with shows up in
-    # no value it returns and in no count of executed Python lines, so a
-    # call site put back on ct_neq_u32() or ct_isnonzero_u32() would
-    # restore the allocation asymmetry that leaked without failing any of
-    # the tests above.  The two tests that follow instrument the alias
-    # tlslite.keyexchange binds and assert what the selection really
-    # called, what it passed, and that such a substitution really is value
-    # preserving.  The structural half of the guard - that the alias
-    # resolves the real byte-domain helper and that neither consumer names
-    # a wide one - lives in test_tlslite_utils_constanttime.
+    # The premaster selection must fold all three rejection conditions
+    # with ct_nonzero_u8(), keeping intermediates in CPython's cached
+    # small-integer range.  An output-equivalent 32-bit helper would
+    # preserve returned values and give every probe class the same
+    # alternative helper trace, so value and within-run trace-equality
+    # tests would still pass despite the allocation asymmetry.  These
+    # tests instrument the consumer alias and arguments; structural
+    # binding/name checks live in test_tlslite_utils_constanttime.
 
     # bit 2 of the accumulator is the length condition, bit 1 the Client
     # Hello version and bit 0 the Server Hello version, so every input
@@ -1929,13 +1909,13 @@ class TestRSAKeyExchange(unittest.TestCase):
                             "domain" % (name, args[0]))
 
     def _premaster_probes(self):
-        """Return the premaster secret probe classes to fold.
+        """Return the premaster-secret probe classes used by fold
+        instrumentation.
 
-        Every class the branch-free selection has to treat alike: the
-        conformant one, the tolerated Server Hello version, a version
-        matching neither hello, a payload that is not 48 bytes long, one
-        that is far longer than 255 bytes, an empty one, and a publicly
-        invalid ciphertext for which decrypt() answers None.
+        The set covers the conformant value, tolerated Server Hello
+        version, unknown version, empty and non-48-byte payloads
+        representable by this key, and a publicly invalid ciphertext for
+        which decrypt() returns None.
         """
         key_size = numBytes(self.srv_pub_key.n)
         probes = []
@@ -1984,18 +1964,15 @@ class TestRSAKeyExchange(unittest.TestCase):
                              % (name, folds.call_count,
                                 self._EXPECTED_FOLDS))
             self._assert_byte_domain_folds(folds, name)
-            # and the method still answers with exactly 48 bytes
             self.assertIsInstance(dec_premaster, bytearray)
             self.assertEqual(48, len(dec_premaster), msg=name)
 
     def test_wide_fold_substitution_changes_no_premaster_secret(self):
-        # Why the fold count above is worth asserting: ct_isnonzero_u32()
-        # answers exactly as ct_nonzero_u8() does for every byte, so with
-        # it at the same call site every premaster secret stays byte
-        # identical - the accepted ones and the turned-down ones alike,
-        # which the patched randomness makes deterministic here. No value
-        # assertion in this class, and no operation count in
-        # test_tlslite_rsa_depadding_uniformity, can see the difference.
+        # Substitute ct_isnonzero_u32() to show why value assertions and
+        # within-run trace equality do not pin helper choice: outputs
+        # remain identical and every probe class receives the same
+        # alternative helper trace.  The consumer fold instrumentation is
+        # what detects the substitution.
         self.assertIsNone(self.keyExchange.makeServerKeyExchange())
 
         for name, enc_premaster in self._premaster_probes():
@@ -2029,7 +2006,6 @@ class TestRSAKeyExchange(unittest.TestCase):
                              "%s: the substitution changed the premaster "
                              "secret" % name)
 
-        # and the alias is the real byte-domain helper again afterwards
         self.assertIs(keyexchange_module.ct_nonzero_u8, ct_nonzero_u8)
 
 class TestDHE_RSAKeyExchange(unittest.TestCase):

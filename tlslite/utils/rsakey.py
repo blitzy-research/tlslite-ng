@@ -426,8 +426,8 @@ class RSAKey(object):
         Note: as a workaround against Bleichenbacher-like attacks, it will
         return a deterministically selected random message in case the padding
         checks failed. It returns an error (None) only in case the ciphertext
-        is of incorrect length or encodes an integer bigger than the modulus
-        of the key (i.e. it's publically invalid).
+        is of incorrect length or encodes an integer that is not smaller than
+        the modulus of the key (i.e. it's publically invalid).
 
         Note: de-padding uses fixed public-width loops and masked
         selection, so Python-level control flow does not depend on padding
@@ -440,10 +440,12 @@ class RSAKey(object):
         :param encBytes: The value which will be decrypted.
 
         :rtype: bytearray or None
-        :returns: A PKCS#1 v1.5 decryption of the passed-in data or None if
-            the provided data is not properly formatted. Note: encrypting
-            an empty string is correct, so it may return an empty bytearray
-            for some ciphertexts.
+        :returns: A PKCS#1 v1.5 decryption of the passed-in data, or None
+            only when the ciphertext length is incorrect or its encoded
+            integer is not smaller than the modulus. Secret padding errors
+            return a deterministically selected synthetic message instead.
+            Note: encrypting an empty string is correct, so it may return
+            an empty bytearray for some ciphertexts.
         """
         if not self.hasPrivateKey():
             raise AssertionError()
@@ -510,9 +512,8 @@ class RSAKey(object):
                 | len_candidate & mask
 
         synth_msg_start = numBytes(n) - synth_length
-        # split into a high and a low byte, so that selecting between the
-        # synthetic start and the real one below can be done without leaving
-        # the byte domain; see the note on helpers that follows
+        # Split the offset into bytes so masked selection can stay in the
+        # byte domain.
         synth_start_hi = synth_msg_start >> 8
         synth_start_lo = synth_msg_start & 0xff
 
@@ -552,9 +553,8 @@ class RSAKey(object):
             #     error_detected = 0x01
             error_detected |= pos_lt_10 & val_is_zero
 
-            # update the message start only once; while the separator is
-            # unseen. (pos+1) because we want to skip the null separator
-            # conceptually (the message start seen as one number):
+            # Select only the first separator at or after offset 10.
+            # pos + 1 skips the separator:
             # if pos >= 10 and not sep_seen and not val:
             #     msg_start = pos+1
             #     sep_seen = 1
@@ -570,10 +570,6 @@ class RSAKey(object):
             msg_start_lo = msg_start_lo & (0xff ^ sep_mask) \
                 | ((pos+1) & 0xff) & sep_mask
 
-        # if separator wasn't found, it's an error
-        # equivalent to:
-        # if not sep_seen:
-        #     error_detected = 0x01
         error_detected |= 1 ^ sep_seen
 
         # the same mask selects the start of the message and the buffer to

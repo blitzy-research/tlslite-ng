@@ -546,10 +546,11 @@ class RSAKeyExchange(KeyExchange):
         # validity and plaintext structure do not change the Python-level
         # control flow.
 
-        # Normalising the candidate keeps it indexable: its first 48 bytes
-        # followed by the 48 random ones are at least 48 bytes long whatever
-        # decrypt() returned, and the appended bytes can only end up
-        # selected when the length is wrong anyway.
+        # Normalise the candidate so version-byte indexing and the 48-byte
+        # selection are defined even for short plaintexts. Appending the
+        # random buffer only pads the candidate; the length check still
+        # rejects every non-48-byte plaintext and selects
+        # randomPreMasterSecret.
         candidate = premasterSecret[:48]
         padded = candidate + randomPreMasterSecret
 

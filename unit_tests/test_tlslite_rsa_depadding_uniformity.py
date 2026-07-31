@@ -9,9 +9,9 @@ CVE-2020-26263) exists whenever the amount of work a server performs
 while de-padding a decrypted RSA block depends on whether the PKCS#1
 v1.5 padding is well formed, or on the structure of the recovered
 plaintext.  ``RSAKey.decrypt()`` and
-``RSAKeyExchange.processClientKeyExchange()`` therefore have to perform a
-fixed sequence of operations whatever the ciphertext decrypts to, and
-select between the recovered plaintext and a synthetic value with
+``RSAKeyExchange.processClientKeyExchange()`` therefore have to follow the
+same Python-level control-flow sequence whatever the ciphertext decrypts
+to, and select between the recovered plaintext and a synthetic value with
 arithmetic rather than with a branch.
 
 This module turns that requirement into an exact, machine-checkable
@@ -25,11 +25,10 @@ is asserted too, because a spread in the totals names the diverging
 class at a glance, but a total is deliberately not the property the
 invariant rests on: two different paths of the same length would
 satisfy a count comparison while executing different code.  The
-measurement is deterministic and noise free, which is precisely why it
-can live in a unit-test suite: a wall-clock timing assertion would be
-flaky in CI and would be a liability here.  Nothing in this module
-measures duration - the invariant is over executed source lines, and it
-must stay one.
+invariant records line events rather than duration, avoiding scheduler
+and timer noise that would make a wall-clock assertion flaky in CI.
+Nothing in this module measures duration - the invariant is over
+executed source lines, and it must stay one.
 
 The module fails loudly if a future edit reintroduces a data-dependent
 branch, a secret-dependent loop bound or an early exit inside the
@@ -61,7 +60,7 @@ assert something false:
   asserted; no absolute count and no source line is hard coded here.
 
 The tests skip themselves when another ``sys.settrace()`` tracer is
-already installed - ``coverage`` above all - because line events cannot
+already installed - especially ``coverage`` - because line events cannot
 then be attributed to this measurement.  They run normally under
 ``python -m unittest discover`` and under ``pytest``, neither of which
 installs a tracer, so the skip is expected only under coverage.
@@ -271,13 +270,10 @@ def depadding_probes(size):
     prefix is corrupted as well, so that all four rejection conditions
     the de-padding loop folds are represented.
 
-    Every class differs from the conformant block only in data the
-    attacker cannot observe directly, so de-padding must execute exactly
-    the same number of Python lines for all of them.  Note that the
-    classes deliberately do not share an outcome: a null byte planted
-    past offset 10 simply becomes the separator and yields a valid, if
-    unexpected, plaintext.  Uniformity is about the operation count, not
-    about the result.
+    Every class must produce the same ordered Python line-event sequence
+    even though their results differ; a null byte past offset 10 becomes
+    a valid earlier separator.  Uniformity here concerns the control-flow
+    sequence, not the returned value.
 
     :param int size: width of the modulus in bytes
     :rtype: dict

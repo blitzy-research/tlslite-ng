@@ -25,8 +25,8 @@ import hypothesis.strategies as st
 from tlslite.utils.compat import compatHMAC
 from tlslite.utils.cryptomath import getRandomBytes
 from tlslite.recordlayer import RecordLayer
-# the two modules that fold secret bytes with ct_nonzero_u8(); imported
-# as modules so that the alias each one binds can be inspected
+# Import consumers as modules so the tests can inspect the helper aliases
+# bound in each namespace.
 from tlslite import keyexchange as keyexchange_module
 from tlslite.utils import rsakey as rsakey_module
 import tlslite.utils.tlshashlib as hashlib
@@ -106,10 +106,8 @@ def _secret_branch(val):
 # the name every secret-dependent call site has to keep resolving
 _HELPER_NAME = "ct_nonzero_u8"
 
-# the two modules the helper was added for: tlslite.utils.rsakey de-pads
-# the decrypted block and tlslite.keyexchange selects the premaster
-# secret.  Each binds the helper in its own namespace, so each is
-# guarded on its own.
+# The two consumers whose secret-byte folds must resolve to this helper.
+# Each imports its own alias, so both bindings are checked.
 _CONSUMER_MODULES = (rsakey_module, keyexchange_module)
 
 # The wide zero and inequality helpers.  On CPython each masks a two's
@@ -117,10 +115,12 @@ _CONSUMER_MODULES = (rsakey_module, keyexchange_module)
 # integer for a non-zero operand and none at all for a zero one, so
 # reaching one of them from a secret byte is the very asymmetry the
 # byte-domain fold was written to remove.  None of them may appear at a
-# secret call site.  ct_lt_u32() is deliberately absent from this list -
-# de-padding applies it to the public loop index and to the public
-# length candidate - and so are ct_lsb_prop_u8() and ct_lsb_prop_u16(),
-# whose intermediates never leave their own bit width.
+# secret call site.  ct_lt_u32() is deliberately absent because this
+# guard is scoped to zero/equality folds on individual bytes; decrypt()
+# uses ct_lt_u32() in separate synthetic-length selection and
+# public-index logic.  ct_lsb_prop_u8() and ct_lsb_prop_u16() are also
+# absent because their intermediates stay within their declared bit
+# widths.
 _WIDE_HELPER_NAMES = ("ct_isnonzero_u32", "ct_neq_u32", "ct_eq_u32",
                       "ct_gt_u32", "ct_le_u32")
 
@@ -366,8 +366,6 @@ class TestContanttime(unittest.TestCase):
         self._assert_source_shape(ct_nonzero_u8)
 
     def test_ct_nonzero_u8_traced_steps(self):
-        # verify line-event observations stay byte-sized and every input
-        # executes the same source lines
         if sys.gettrace() is not None:
             self.skipTest("another tracer is already installed")
         self._assert_traced_shape(ct_nonzero_u8)
@@ -749,34 +747,18 @@ class TestCompareDigest(unittest.TestCase):
                                            bytearray(b'\x03' + b'\x01'*10)))
 
 class TestCtNonzeroU8Consumers(unittest.TestCase):
-    """Bind ct_nonzero_u8 to the code that must fold secret bytes with it.
+    """Bind ct_nonzero_u8 to the consumers that fold secret bytes.
 
-    The tests above pin the helper in isolation.  On their own they cannot
-    catch the regression they exist to prevent: putting one of the 32-bit
-    helpers back at a secret call site of ``RSAKey.decrypt()`` or of
-    ``RSAKeyExchange.processClientKeyExchange()`` returns exactly the same
-    values and executes exactly the same number of Python lines, so
-    neither the value tests in this suite nor the operation-count
-    invariant in ``test_tlslite_rsa_depadding_uniformity`` would fail -
-    while the CPython allocation asymmetry that the byte-domain fold was
-    written to remove would be back.
+    An output-equivalent 32-bit helper preserves return values and gives
+    each probe class the same alternative helper trace, so value tests and
+    the within-run operation-sequence invariant do not pin helper identity.
+    The consumer must therefore bind ct_nonzero_u8 itself and name no wide
+    helper.  Negative controls verify the code-object and module-binding
+    checks.
 
-    These tests therefore watch the real methods rather than a model of
-    them: whatever a secret call site resolves has to be the byte-domain
-    helper itself, and no wide helper may be named anywhere in their code
-    objects.  Two controls keep the checks from passing vacuously - a call
-    site that reaches a 32-bit helper is rejected, and so is a module
-    whose alias has been replaced by an output-equivalent stand-in.
-
-    The value-preserving other half of the guard - that the helper really
-    is reached once for every secret byte, and only with byte-domain
-    arguments - needs a private key and a live key exchange, so it lives
-    with each consumer's own fixtures, in ``test_tlslite_utils_rsakey``
-    and in ``test_tlslite_keyexchange``.
-
-    Nothing here measures duration and nothing here installs a trace
-    function, so unlike the operation-count module these tests also run
-    under coverage, which is how most of this suite's CI time is spent.
+    Consumer-fixture tests separately assert fold counts, byte-domain
+    arguments, and value preservation.  These checks do not measure
+    duration or install a trace function, so they run under coverage.
     """
 
     def tearDown(self):
@@ -838,11 +820,10 @@ class TestCtNonzeroU8Consumers(unittest.TestCase):
                              "depends on its operand" % (name, wide))
 
     def assert_binding_rejected(self, module, helper):
-        """Assert the binding check fails while helper is substituted.
+        """Assert the binding check fails for a substituted helper.
 
-        The alias is put back afterwards and the restoration is asserted,
-        because a control that left a substituted helper behind would be
-        worse than no control at all.
+        The helper is restored in a finally block and restoration is
+        asserted so the negative control cannot contaminate later tests.
 
         :param module: module whose helper alias is substituted
         :param helper: output-equivalent replacement to install
@@ -858,8 +839,6 @@ class TestCtNonzeroU8Consumers(unittest.TestCase):
             setattr(module, _HELPER_NAME, real)
         self.assertIs(real, getattr(module, _HELPER_NAME), label)
 
-    # Test methods carry no docstrings: their names describe the case and
-    # every test in this module follows that convention.
     def test_consumers_bind_the_real_helper(self):
         for module in _CONSUMER_MODULES:
             self.assert_helper_binding(module)
@@ -869,18 +848,14 @@ class TestCtNonzeroU8Consumers(unittest.TestCase):
             self.assert_no_wide_helper(func)
 
     def test_wide_helper_reference_is_detected(self):
-        # a control on the check above: a call site that reaches a 32-bit
-        # helper has to be rejected, or the check would pass against the
-        # very shape it exists to forbid
+        # Negative control: a consumer that names a 32-bit helper must
+        # fail the structural check.
         self.assertRaises(AssertionError, self.assert_no_wide_helper,
                           _u32_delegate)
 
     def test_substituted_helper_is_detected(self):
-        # and a control on the binding check: each of these stand-ins
-        # answers exactly as the byte-domain helper does for every byte -
-        # the rejections test above asserts that equivalence - so no
-        # value anywhere in the library would change if one of them were
-        # reached instead.  Only an identity check can tell.
+        # Negative control: output-equivalent stand-ins must fail the
+        # identity check.
         for insecure in (_u32_delegate, _u32_inline, _secret_branch):
             for module in _CONSUMER_MODULES:
                 self.assert_binding_rejected(module, insecure)

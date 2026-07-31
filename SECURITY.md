@@ -20,22 +20,21 @@ The RSA PKCS#1 v1.5 decryption path has been hardened further against the
 Bleichenbacher-style padding oracle tracked as CVE-2020-26263. De-padding no
 longer branches on secret data, no longer exits early inside the
 secret-dependent region, and no longer runs loops whose trip count is derived
-from a secret, so the sequence of operations it performs does not depend on
+from a secret, so the Python-level control-flow sequence does not depend on
 whether the padding was well formed, nor on the length or the two leading
 version bytes of the recovered plaintext. When the padding does not check out
 it still substitutes a deterministically derived synthetic plaintext, the
 behaviour RFC 5246 section 7.4.7.1 requires of a TLS server that receives an
-incorrectly formatted premaster secret. The Python-level path is structured
-to keep the same control-flow shape for all secret-dependent input classes.
-That structure is checked rather than merely asserted: the unit test suite
-records the ordered sequence of Python line events executed both by the
-de-padding step and by the premaster secret selection that consumes it, and
-requires those sequences to be identical across the secret-dependent probe
-classes at several key sizes. It compares them within a single run rather
-than against fixed numbers, and deliberately leaves out the publicly
-visible rejections described below. Because it sees Python-level control
-flow only, it is a regression guard against a data-dependent branch
-returning rather than a proof that the path is constant time.
+incorrectly formatted premaster secret. The uniformity of that sequence is
+checked rather than merely asserted: the unit test suite records the ordered
+sequence of Python line events executed both by the de-padding step and by
+the premaster secret selection that consumes it, and requires those
+sequences to be identical across the secret-dependent probe classes at
+several key sizes. It compares them within a single run rather than against
+fixed numbers, and deliberately leaves out the publicly visible rejections
+described below. Because this guard observes Python-level control flow only,
+it can detect reintroduced data-dependent branches or loop counts; it does
+not prove that the path is constant time.
 
 This is timing hardening, **NOT** an absolute constant-time guarantee, so the
 residual is described here rather than left implicit. Because the public RSA
@@ -51,11 +50,12 @@ hardware and the path it is observed over, and it is **not zero**.
 Decryption also still reports an error immediately when the ciphertext is the
 wrong length for the modulus or encodes an integer that is not smaller than
 it; that early exit is deliberate and is not an oracle, because whoever sent
-the message already knows both facts about it. That uniformity also relies on
-CPython caching small integers as singletons, the same interpreter behaviour
-described above, so the residual timing profile may differ on other Python
-implementations, which our CI does not exercise; the functional result is
-identical on any conforming Python, only the timing profile would differ.
+the message already knows both facts about it. The secret-dependent path's
+Python-level uniformity also relies on CPython caching small integers as
+singletons, the same interpreter behaviour described above, so the residual
+timing profile may differ on other Python implementations, which our CI does
+not exercise; the functional result is identical on any conforming Python,
+only the timing profile would differ.
 
 In other words, pure-python (tlslite-ng internal) implementations of all
 ciphers, as well as all CBC mode ciphers working in MAC-then-encrypt mode are

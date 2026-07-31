@@ -15,8 +15,8 @@ from tlslite.utils.cryptomath import *
 from tlslite.errors import *
 from tlslite.utils.keyfactory import parsePEMKey, generateRSAKey
 from tlslite.utils.compat import a2b_hex, remove_whitespace
-# the de-padding helpers themselves, and the module whose alias for the
-# byte-domain one the tests below instrument
+# Import the fold helpers and consumer module so tests can instrument its
+# bound alias.
 from tlslite.utils.constanttime import ct_isnonzero_u32, ct_nonzero_u8
 from tlslite.utils import rsakey as rsakey_module
 try:
@@ -4235,7 +4235,6 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
         block[0] = 0x00
         block[1] = 0x02
         for pos in range(2, sep):
-            # every padding byte has to be non-zero
             block[pos] = 1 + (pos * 13) % 0xff
         block[sep] = 0x00
         block[sep + 1:] = self._payload(payload_len)
@@ -4415,8 +4414,9 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
         self.assertEqual(third, expected)
 
     def test_synthetic_value_depends_on_the_ciphertext(self):
-        # a constant fallback would be trivial to detect, so different
-        # invalid ciphertexts have to give different synthetic answers
+        # A constant fallback would be distinguishable, so verify that
+        # these independently crafted invalid ciphertexts do not all
+        # produce the same synthetic answer.
         seen = []
         for offset in (2, 3, 4, 5):
             block = self._conformant_block(48)
@@ -4447,18 +4447,14 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
         self.assertEqual(len(message_random), self.width)
         self.assertEqual(len(calc_lengths(self.priv_key, kdk)), 128)
 
-    # De-padding folds every secret byte with ct_nonzero_u8(), whose
-    # intermediates all stay inside CPython's cached small integer range.
-    # Which helper it folds with is invisible in the values it returns and
-    # invisible in the number of Python lines it executes, so a call site
-    # put back on ct_isnonzero_u32() or ct_neq_u32() would restore the
-    # allocation asymmetry that leaked without failing any of the tests
-    # above.  The three tests that follow instrument the alias
-    # tlslite.utils.rsakey binds and assert what de-padding really called,
-    # what it passed, and that the substitution really is value preserving.
-    # The structural half of the guard - that the alias resolves the real
-    # byte-domain helper and that neither method names a wide one - lives
-    # in test_tlslite_utils_constanttime.
+    # De-padding must fold every secret byte with ct_nonzero_u8(), whose
+    # intermediates stay in CPython's cached small-integer range.  A
+    # value-equivalent 32-bit helper would preserve outputs and give every
+    # probe class the same alternative helper trace, so value and
+    # within-run trace-equality tests would still pass despite the
+    # allocation asymmetry.  These tests instrument the consumer alias and
+    # arguments; structural binding/name checks live in
+    # test_tlslite_utils_constanttime.
 
     @staticmethod
     def _fold_recorder():
@@ -4496,7 +4492,6 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
             with self._fold_recorder() as folds:
                 msg = self.priv_key.decrypt(ciphertext)
 
-            # recording only observes, so no value may move
             self.assertEqual(msg, expected,
                              "%s: recording changed the plaintext" % name)
             # the two prefix bytes and then one fold for each remaining
@@ -4522,13 +4517,11 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
         self.assertEqual(folds.call_count, 0)
 
     def test_wide_fold_substitution_changes_no_plaintext(self):
-        # Why the fold count above is worth asserting: ct_isnonzero_u32()
-        # answers exactly as ct_nonzero_u8() does for every byte, so with
-        # it at the same call sites every plaintext stays byte identical
-        # and the executed line count stays the same too.  Neither the
-        # probe matrix above nor the operation count invariant in
-        # test_tlslite_rsa_depadding_uniformity can see the difference -
-        # only instrumenting the call sites can.
+        # Substitute the output-equivalent wide helper to prove that value
+        # assertions alone cannot distinguish it.  The absolute trace
+        # changes, but it changes equally for every probe class, so the
+        # uniformity invariant still passes; only consumer instrumentation
+        # pins the helper choice.
         for name, block, _ in self._probes():
             ciphertext = self._encrypt_block(block)
             expected = self.priv_key.decrypt(ciphertext)
@@ -4542,5 +4535,4 @@ class TestRSADepaddingProbeClasses(unittest.TestCase):
                              "%s: the substitution changed the plaintext"
                              % name)
 
-        # and the alias is the real byte-domain helper again afterwards
         self.assertIs(rsakey_module.ct_nonzero_u8, ct_nonzero_u8)
