@@ -103,6 +103,41 @@ def _secret_branch(val):
     return 0
 
 
+# Controls for the wide-helper check in TestCtNonzeroU8Consumers.  Each
+# folds in the byte domain first and only then reaches one wide helper,
+# so the check's "the fold is named at all" assertion is satisfied and
+# its wide-helper loop is the only assertion left that can reject the
+# fixture.  A control that never folds cannot tell the two apart: the
+# first assertion raises in place of the second, and the loop could be
+# deleted without the control noticing.  All five answer exactly as
+# ct_nonzero_u8() does for every byte, so a real call site reaching one
+# of them would change no value anywhere - only its CPython allocation
+# cost - which is why the structural check exists in the first place.
+def _fold_then_isnonzero_u32(val):
+    """Insecure shape: folds, then hands the bit to ct_isnonzero_u32."""
+    return ct_isnonzero_u32(ct_nonzero_u8(val))
+
+
+def _fold_then_neq_u32(val):
+    """Insecure shape: folds, then tests the bit with ct_neq_u32."""
+    return ct_neq_u32(ct_nonzero_u8(val), 0)
+
+
+def _fold_then_eq_u32(val):
+    """Insecure shape: folds, then tests the bit with ct_eq_u32."""
+    return ct_eq_u32(ct_nonzero_u8(val), 1)
+
+
+def _fold_then_gt_u32(val):
+    """Insecure shape: folds, then tests the bit with ct_gt_u32."""
+    return ct_gt_u32(ct_nonzero_u8(val), 0)
+
+
+def _fold_then_le_u32(val):
+    """Insecure shape: folds, then tests the bit with ct_le_u32."""
+    return ct_le_u32(1, ct_nonzero_u8(val))
+
+
 # the name every secret-dependent call site has to keep resolving
 _HELPER_NAME = "ct_nonzero_u8"
 
@@ -123,6 +158,23 @@ _CONSUMER_MODULES = (rsakey_module, keyexchange_module)
 # widths.
 _WIDE_HELPER_NAMES = ("ct_isnonzero_u32", "ct_neq_u32", "ct_eq_u32",
                       "ct_gt_u32", "ct_le_u32")
+
+# One control per name above, so a name whose rejection stopped being
+# asserted is caught even if the others still are.  The pairing itself is
+# asserted, so a wide helper added to the list without a control fails
+# loudly rather than going unexercised.
+_WIDE_CONTROL_FIXTURES = (("ct_isnonzero_u32", _fold_then_isnonzero_u32),
+                          ("ct_neq_u32", _fold_then_neq_u32),
+                          ("ct_eq_u32", _fold_then_eq_u32),
+                          ("ct_gt_u32", _fold_then_gt_u32),
+                          ("ct_le_u32", _fold_then_le_u32))
+
+# Phrases unique to each rejection assert_no_wide_helper() can make.
+# They are written once here and used both by that method's messages and
+# by the controls, so a reworded message cannot quietly leave a control
+# accepting the wrong rejection.
+_NO_FOLD_PHRASE = "does not reference"
+_WIDE_CALL_PHRASE = "whose CPython cost depends on its operand"
 
 
 class TestContanttime(unittest.TestCase):
@@ -805,6 +857,10 @@ class TestCtNonzeroU8Consumers(unittest.TestCase):
         copy of the source, so this cannot drift away from the code that
         actually runs.
 
+        Two rejections are possible and each carries its own phrase, so
+        the controls below can require the one whose assertion they guard
+        instead of accepting whichever happens to fire first.
+
         :param func: function or method to inspect
         """
         code = _code_of(func)
@@ -812,12 +868,40 @@ class TestCtNonzeroU8Consumers(unittest.TestCase):
         self.assertTrue(code is not None,
                         "no code object available for %s" % name)
         self.assertIn(_HELPER_NAME, code.co_names,
-                      "%s does not reference %s at all"
-                      % (name, _HELPER_NAME))
+                      "%s %s %s at all"
+                      % (name, _NO_FOLD_PHRASE, _HELPER_NAME))
         for wide in _WIDE_HELPER_NAMES:
             self.assertNotIn(wide, code.co_names,
-                             "%s references %s, whose CPython cost "
-                             "depends on its operand" % (name, wide))
+                             "%s references %s, %s"
+                             % (name, wide, _WIDE_CALL_PHRASE))
+
+    def assert_rejected_for(self, func, reason, detail):
+        """Assert assert_no_wide_helper() rejects func for one reason.
+
+        That method asserts the byte-domain helper is named before it
+        asserts that no wide helper is, so a control which only required
+        "some AssertionError" would keep passing if the second assertion
+        were deleted - the first would raise in its place.  The message is
+        therefore read back and both the phrase of the intended rejection
+        and the name it reports are required, which is what ties each
+        control to the single assertion it exists to guard.
+
+        :param func: function whose code object has to be rejected
+        :param reason: phrase unique to the intended rejection
+        :param detail: name that rejection has to report
+        """
+        label = getattr(func, "__name__", repr(func))
+        try:
+            self.assert_no_wide_helper(func)
+        except AssertionError as err:
+            reported = str(err)
+        else:
+            self.fail("%s was accepted, expected a rejection saying %r"
+                      % (label, reason))
+        for needle in (reason, detail):
+            self.assertIn(needle, reported,
+                          "%s was rejected without mentioning %r: %s"
+                          % (label, needle, reported))
 
     def assert_binding_rejected(self, module, helper):
         """Assert the binding check fails for a substituted helper.
@@ -848,10 +932,45 @@ class TestCtNonzeroU8Consumers(unittest.TestCase):
             self.assert_no_wide_helper(func)
 
     def test_wide_helper_reference_is_detected(self):
-        # Negative control: a consumer that names a 32-bit helper must
-        # fail the structural check.
-        self.assertRaises(AssertionError, self.assert_no_wide_helper,
-                          _u32_delegate)
+        # a control on the wide-helper loop of the check above: each
+        # fixture folds in the byte domain and then still reaches one wide
+        # helper, so that loop is the only assertion able to reject it and
+        # its removal is detected.  One fixture per name in
+        # _WIDE_HELPER_NAMES, so dropping a single name is detected too.
+        for wide, func in _WIDE_CONTROL_FIXTURES:
+            self.assert_rejected_for(func, _WIDE_CALL_PHRASE, wide)
+
+    def test_missing_helper_reference_is_detected(self):
+        # and a control on the other assertion of the same check: a call
+        # site the fold no longer reaches at all is rejected for that
+        # reason, which is what keeps the checks above from passing
+        # vacuously against code the helper was removed from
+        self.assert_rejected_for(_u32_delegate, _NO_FOLD_PHRASE,
+                                 _HELPER_NAME)
+
+    def test_every_wide_helper_has_a_control(self):
+        # the controls are only as complete as this pairing: a wide helper
+        # listed without a fixture would never be exercised, and a fixture
+        # that stopped folding would silently stop discriminating between
+        # the two rejections - the same defect the controls guard against
+        self.assertEqual(sorted(_WIDE_HELPER_NAMES),
+                         sorted(pair[0] for pair
+                                in _WIDE_CONTROL_FIXTURES))
+        for wide, func in _WIDE_CONTROL_FIXTURES:
+            code = _code_of(func)
+            self.assertIn(_HELPER_NAME, code.co_names,
+                          "%s does not fold, so it cannot isolate the "
+                          "wide-helper assertion" % func.__name__)
+            self.assertIn(wide, code.co_names,
+                          "%s does not reach %s"
+                          % (func.__name__, wide))
+            # output equivalence is what makes the control faithful: a
+            # call site reaching one of these would change no value, so
+            # only a structural check could ever notice
+            for i in range(256):
+                self.assertEqual(ct_nonzero_u8(i), func(i),
+                                 "%s is not output equivalent at %d"
+                                 % (func.__name__, i))
 
     def test_substituted_helper_is_detected(self):
         # Negative control: output-equivalent stand-ins must fail the

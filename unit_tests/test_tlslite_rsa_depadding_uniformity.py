@@ -39,10 +39,18 @@ into a comparison of totals alone, nor into a tolerance-based one.  What
 it cannot see is a divergence that never leaves a single source line - a
 conditional expression choosing between two C-level calls, say - so it
 is a regression guard against reintroduced Python control flow rather
-than a proof that the path is constant time.
+than a proof that the path is constant time.  That blind spot is covered
+by three sibling tests, and the coupling is deliberate rather than
+incidental: ``test_every_secret_byte_is_folded_in_the_byte_domain`` and
+``test_wide_fold_substitution_changes_no_plaintext`` in
+``test_tlslite_utils_rsakey.py`` instrument the fold call sites
+themselves, and ``test_consumers_name_no_wide_helper`` in
+``test_tlslite_utils_constanttime.py`` refuses a consumer that so much as
+names a wide helper.  Whoever weakens one of the four should expect the
+others to be all that is left.
 
-Two deliberate exclusions, each of which would otherwise make the module
-assert something false:
+Three deliberate exclusions, each of which would otherwise make the
+module assert something false:
 
 - The *publicly invalid* class is not part of the equivalence set, and
   neither of its two triggers is: a ciphertext whose length does not
@@ -58,13 +66,41 @@ assert something false:
   modulus widths and between revisions of the code under test.  Only
   equality within a single run and within a single modulus width is
   asserted; no absolute count and no source line is hard coded here.
+- Object finalizers are not part of any measurement.  ``__del__`` is
+  code the interpreter runs on its own account, at whatever point the
+  last reference to an object happens to go away, so which probe class's
+  traced window it lands in is a function of the allocation history of
+  the whole test run and not of the ciphertext being de-padded.  The
+  package defines five of them, all releasing a native handle in an
+  M2Crypto backed wrapper, and none is ever called by the code under
+  test, so a recorded finalizer can only ever be noise.  Recording one
+  would report a divergence in code that did not diverge - and would do
+  so with a message accusing the de-padding path of a timing leak, which
+  is the most misleading failure this module could produce.  Finalizer
+  frames and everything they call are therefore left out of the
+  recording, and the collector is held off for the duration of each
+  measurement so that it cannot run one there in the first place.
 
 The tests skip themselves when another ``sys.settrace()`` tracer is
 already installed - especially ``coverage`` - because line events cannot
 then be attributed to this measurement.  They run normally under
 ``python -m unittest discover`` and under ``pytest``, neither of which
 installs a tracer, so the skip is expected only under coverage.
+
+The hygiene that keeps a finalizer and the collector out of a traced
+window is described where it is built, in ``trace_line_events``, and is
+asserted by the tests in ``TestTracerHygiene`` rather than left to
+inspection.  It matters most where M2Crypto is installed, because that is
+the only configuration in which the package's finalizers exist to be
+reached at all, and it is one the project supports and its CI exercises.
 """
+
+# The instrument, the probe taxonomy, the fixtures and the invariant they
+# serve belong together: each of them is only meaningful beside the
+# others, and a measurement whose method lived in another file would be
+# read without it.  That puts the module over the default length limit,
+# as the two test modules it corroborates are as well.
+# pylint: disable=too-many-lines
 
 # compatibility with Python 2.6, for that we need unittest2 package,
 # which is not available on 3.3 or 3.4
@@ -73,7 +109,9 @@ try:
 except ImportError:
     import unittest
 
+import gc
 import sys
+from types import FunctionType
 
 from tlslite.constants import CipherSuite
 from tlslite.keyexchange import RSAKeyExchange
@@ -89,6 +127,61 @@ from tlslite.utils.keyfactory import generateRSAKey
 # configuration and on every supported interpreter.
 PACKAGE_NAME = "tlslite"
 PACKAGE_PREFIX = "tlslite."
+
+# A finalizer runs whenever the interpreter decides the object owning it
+# is unreachable, which has nothing to do with the operation being
+# measured: the garbage collector can fire one in the middle of any probe
+# class and charge that class lines the other classes never execute.  The
+# collector is therefore drained and switched off around every
+# measurement (see trace_line_events), and frames of this name are never
+# recorded, so that a finalizer reached by a reference count dropping to
+# zero cannot contaminate a measurement either.  Every finalizer tlslite
+# defines today lives in one of the optional OpenSSL modules, which is
+# why leaving this unguarded only broke the measurement when M2Crypto was
+# installed - a configuration this project supports and its CI exercises.
+FINALIZER_NAME = "__del__"
+
+# Names of the code objects the interpreter runs on its own account
+# rather than on behalf of the code under test, and which are therefore
+# excluded from every recording along with everything they call.
+#
+# ``__del__`` is the only one the package defines: the M2Crypto backed
+# cipher and RSA key wrappers release their native handles there
+# (``openssl_rsakey``, ``openssl_aes`` twice, ``openssl_rc4`` and
+# ``openssl_tripledes``).  Nothing calls any of them explicitly, so a
+# finalizer frame can never be a legitimate step of the de-padding path;
+# it is reached only when the last reference to such an object goes away,
+# which is a property of the allocation history of the whole test run.
+# Its own frame is not the whole of the exposure either - a finalizer may
+# call back into the package, as ``OpenSSL_RSAKey.__del__`` does when it
+# reads an attribute of a class that defines ``__getattr__`` - so the
+# suppression has to cover the callees too, and it does.  The tuple is
+# built from FINALIZER_NAME so that the suppression and the tests that
+# assert it cannot come to disagree about what a finalizer is called.
+INTERPRETER_CALLBACKS = (FINALIZER_NAME,)
+
+# Module name the stand-in finalizer of the hygiene tests is attributed
+# to.  It names the package on purpose - that is what makes the tracer
+# treat the stand-in exactly as it would treat a finalizer the library
+# really defines - and it names no real module, so nothing can import it.
+FINALIZER_MODULE = PACKAGE_PREFIX + "finalizer_stand_in"
+
+# Number of unreachable finalizer cycles the hygiene tests leave pending.
+# One would do; a few dozen make it near certain that a collection which
+# fired inside a measurement would be seen in the recorded sequence
+# rather than merely be possible.
+FINALIZER_CYCLES = 64
+
+# How close to the collector's own generation zero threshold the hygiene
+# tests arm it.  Small enough that the next handful of allocations would
+# trigger a collection, which is what puts a collection inside the
+# measured window when nothing keeps it out.
+GC_ARMING_MARGIN = 20
+
+# Handed to a package function when a measurement has to record
+# something and what it computes is beside the point.  Any integer wider
+# than a machine word does; nothing depends on the value.
+SAMPLE_INTEGER = 1 << 127
 
 # Reported when something else owns the trace hook.  ``coverage``
 # installs its own tracer and the project's canonical coverage command
@@ -182,10 +275,45 @@ def trace_line_events(operation, payload):
     None for every other frame so that unrelated library and standard
     library code is neither recorded nor slowed down.
 
+    What the operation itself executes is the only thing measured, so the
+    work the interpreter does on its own account while the hook is up is
+    kept out of the recording in two complementary ways.  Neither weakens
+    the invariant: both remove events that belong to the process rather
+    than to the payload, and an event the code under test executed is
+    still recorded whatever the payload is.
+
+    - Finalizers are suppressed as whole subtrees.  A frame named in
+      ``INTERPRETER_CALLBACKS`` is counted in when it is entered and out
+      when it returns, and nothing at all is recorded while that count is
+      non zero, so a finalizer that calls back into the package cannot
+      contribute either.  The count is balanced even when a finalizer
+      raises, because the interpreter reports ``'return'`` for a frame
+      that is unwinding as well as for one returning normally.  Keying on
+      the frame rather than on the collector is what covers the finalizer
+      of an object whose reference count reaches zero while the operation
+      runs, because that happens whether the collector is on or off.
+    - The cyclic garbage collector is held off for the duration of the
+      measurement, and pending garbage is collected before the hook goes
+      up rather than during it, which runs whatever finalizers are due
+      outside the window rather than inside it.  Which measurement a
+      collection would otherwise fall in depends on how much the rest of
+      the test run has allocated, which is exactly the kind of process
+      wide accident that must not be mistaken for a property of the
+      ciphertext.
+
+    Without those guards a finalizer belonging to the package - every one
+    tlslite has lives in an optional OpenSSL module - lands inside one
+    probe class's window and only that class's, which reads as a spread in
+    the executed line counts and accuses the de-padding path of a
+    regression it does not have.
+
     Whatever tracer was installed beforehand is restored in a ``finally``
-    block, so neither a normal return nor an exception raised inside
-    ``operation`` can leave a tracer behind to slow down or perturb the
-    rest of the test suite.
+    block, and so is the collector's previous state, so neither a normal
+    return nor an exception raised inside ``operation`` can leave either
+    behind to slow down or perturb the rest of the test suite.  The
+    collector is restored to the state it was found in rather than simply
+    enabled, so a caller that deliberately runs without it keeps its
+    choice.
 
     :param operation: callable invoked once under the tracer
     :param payload: sole argument passed to ``operation``
@@ -194,24 +322,220 @@ def trace_line_events(operation, payload):
         triples, one per line event executed inside the tlslite package
     """
     steps = []
+    # depth of the finalizer subtree currently executing; held in a list
+    # because the nested functions below have to mutate it and this
+    # module supports interpreters without ``nonlocal``
+    suppressed = [0]
+
+    def suppress(_frame, event, _arg):
+        """Swallow a finalizer frame's events and count it out again."""
+        if event == "return":
+            suppressed[0] -= 1
+        return suppress
 
     def tracer(frame, event, _arg):
         """Record 'line' events raised by frames of the tlslite package."""
+        if event == "call" \
+                and frame.f_code.co_name in INTERPRETER_CALLBACKS:
+            suppressed[0] += 1
+            return suppress
         name = frame.f_globals.get("__name__")
         if name is not None and (name == PACKAGE_NAME
                                  or name.startswith(PACKAGE_PREFIX)):
-            if event == "line":
+            if event == "line" and not suppressed[0]:
                 steps.append((name, frame.f_code.co_name, frame.f_lineno))
             return tracer
         return None
 
+    collecting = gc.isenabled()
+    gc.collect()
+    if collecting:
+        gc.disable()
     previous = sys.gettrace()
     sys.settrace(tracer)
     try:
         operation(payload)
     finally:
         sys.settrace(previous)
+        if collecting:
+            gc.enable()
     return steps
+
+
+def finalizer_steps(trace):
+    """Return the steps of one trace that a finalizer contributed.
+
+    A finalizer belongs to whatever object the interpreter happened to
+    reclaim, never to the operation under measurement, so a recorded
+    trace containing one is a contaminated measurement whatever else it
+    says.
+
+    :param trace: ordered trace to examine
+    :rtype: list
+    :returns: the recorded (module, code name, line) triples raised by a
+        finalizer frame, in the order they were recorded
+    """
+    found = []
+    for step in trace:
+        if step[1] == FINALIZER_NAME:
+            found.append(step)
+    return found
+
+
+class _FinalizerStandIn(object):
+    """Template the stand-in finalizer's code object is taken from.
+
+    Nothing instantiates this class: only the code object of its
+    finalizer is used, because a code object compiled from a real
+    ``__del__`` carries the name a real finalizer's frames carry, which
+    is what the guard in ``trace_line_events`` keys on.  Writing it out
+    here rather than building it from a string keeps it readable and
+    keeps it under the same static analysis as the rest of the module.
+    """
+
+    # nothing but the finalizer belongs here, and a public method would
+    # have to be invented to satisfy the usual minimum
+    # pylint: disable=too-few-public-methods
+
+    #: replaced by the list make_finalizer_class() is given
+    recorder = []
+
+    def __del__(self):
+        self.recorder.append(1)
+
+
+def make_finalizer_class(recorder):
+    """Build a class whose finalizer is attributed to the package.
+
+    A stand-in is used rather than one of the library's own finalizers
+    because every finalizer tlslite defines lives in an optional OpenSSL
+    module: a test built on one of those would exercise the guard only
+    where M2Crypto happens to be installed, which is precisely the
+    configuration in which the guard was found to be missing.  Rebinding
+    the template's code object to a namespace whose ``__name__`` names
+    the package produces a finalizer the tracer's predicate accepts on
+    every installation, so the guard is tested everywhere.
+
+    :param recorder: list every finalization appends to, so that a test
+        can tell a finalizer that ran from one that never did
+    :rtype: type
+    :returns: class whose instances record their own finalization
+    """
+    template = _FinalizerStandIn.__dict__[FINALIZER_NAME]
+    namespace = {"__name__": FINALIZER_MODULE}
+    finalizer = FunctionType(template.__code__, namespace, FINALIZER_NAME)
+    return type("FinalizerStandIn", (object,),
+                {"__del__": finalizer, "recorder": recorder})
+
+
+def seed_finalizer_cycles(recorder, count):
+    """Leave unreachable reference cycles carrying a package finalizer.
+
+    The cycle is what makes the finalization *pending*: nothing but the
+    collector can reach the objects, so their finalizers run when it next
+    runs rather than at a point the caller controls.  That is the state
+    the optional OpenSSL cipher objects of an earlier test are left in,
+    and it is what used to contaminate a measurement here.
+
+    Collecting first is what makes the seeding reliable rather than
+    likely: it puts the collector's generation zero counter back at the
+    bottom of its range, so the cycles seeded here cannot trip a
+    collection of their own on the way in and be gone again before the
+    measurement they are meant to threaten.
+
+    :param recorder: list every finalization appends to
+    :param int count: number of unreachable cycles to leave behind
+    :rtype: None
+    """
+    gc.collect()
+    stand_in = make_finalizer_class(recorder)
+    for _ in range(count):
+        obj = stand_in()
+        obj.self_reference = obj
+        del obj
+
+
+def fill_young_generation():
+    """Allocate tracked objects until a collection is imminent.
+
+    Arming the collector this way is what turns "a collection could fire
+    inside the measured window" into "the next few allocations will fire
+    one", which is what the guards in ``trace_line_events`` have to
+    withstand.  The returned list has to stay alive for the arming to
+    hold: freeing a tracked object decrements the very counter allocating
+    it incremented.
+
+    :rtype: tuple
+    :returns: (list holding the allocated objects alive, generation zero
+        count reached)
+    """
+    target = gc.get_threshold()[0] - GC_ARMING_MARGIN
+    ballast = []
+    while gc.get_count()[0] < target:
+        ballast.append([])
+    return ballast, gc.get_count()[0]
+
+
+def observe_collector(recorder):
+    """Record the collector's state from inside the measured window.
+
+    A little package work is done as well, so that the measurement
+    records something: assertions made against an empty recording would
+    hold for a tracer that was never installed at all.
+
+    :param recorder: list the observation is appended to, as a
+        (collector enabled, generation zero count) pair
+    :rtype: None
+    """
+    recorder.append((gc.isenabled(), gc.get_count()[0]))
+    numBytes(SAMPLE_INTEGER)
+
+
+def churn_inside_window(recorder):
+    """Allocate past the armed threshold from inside the window.
+
+    Arming the collector only makes a collection imminent; something has
+    to make the allocations that trip it.  De-padding a real block makes
+    thousands of them, which is why the invariant's own measurements are
+    exposed to this at all, and this does the same for a fraction of the
+    cost so that the guards can be tested without a key.  The collector's
+    state is recorded first, so a caller can tell an armed collection
+    that was prevented from one that was never armed.
+
+    :param recorder: list the observation is appended to
+    :rtype: None
+    """
+    observe_collector(recorder)
+    churn = [[] for _ in range(GC_ARMING_MARGIN * 4)]
+    del churn[:]
+
+
+def drop_only_reference(holder):
+    """Release the payload's contents from inside the measured window.
+
+    Emptying the list drops the last reference to whatever it held, so a
+    finalizer runs at that point rather than at some later and unrelated
+    one.  The same package work as ``observe_collector`` follows it, so
+    that a recording made with something in the holder can be compared
+    against one made with an empty holder.
+
+    :param holder: list emptied inside the window
+    :rtype: None
+    """
+    del holder[:]
+    numBytes(SAMPLE_INTEGER)
+
+
+def raise_inside_window(payload):
+    """Fail from inside the measured window, after doing package work.
+
+    :param payload: ignored, the signature is the one measure() needs
+    :rtype: None
+    :raises ValueError: always, which is the whole point
+    """
+    del payload
+    numBytes(SAMPLE_INTEGER)
+    raise ValueError("failure raised inside the measured window")
 
 
 def pkcs1_block(size, separator, payload):
@@ -762,6 +1086,9 @@ class UniformityTestCase(unittest.TestCase):
             raise unittest.SkipTest(TRACER_BUSY)
 
     def setUp(self):
+        # recorded before the tracer guard so that tearDown can hold the
+        # measurement to handing the process back as it found it
+        self.collecting = gc.isenabled()
         # guarded again per test: a tracer installed between class set-up
         # and the test itself would make every measurement meaningless
         if tracing_active():
@@ -775,6 +1102,15 @@ class UniformityTestCase(unittest.TestCase):
             sys.gettrace(),
             "a trace function outlived the measurement and would now "
             "perturb the rest of the test suite")
+        # and neither may the collector be left in the state a
+        # measurement put it in: measurements hold it off so that a
+        # collection cannot run a finalizer inside a traced window, and
+        # leaving it off afterwards would let the rest of the suite
+        # accumulate unreclaimed cycles
+        self.assertEqual(
+            self.collecting, gc.isenabled(),
+            "the measurement left the cyclic garbage collector %s"
+            % ("disabled" if self.collecting else "enabled"))
 
 
 # Test methods in this package carry no docstrings: their names describe
@@ -782,6 +1118,129 @@ class UniformityTestCase(unittest.TestCase):
 # classes and the module itself are documented above, as the project's
 # pylint configuration requires.
 # pylint: disable=missing-function-docstring
+
+
+class TestTracerHygiene(UniformityTestCase):
+    """The measurement is fenced off from the garbage collector.
+
+    The invariant the rest of the module asserts is only as trustworthy
+    as the instrument it is measured with, and there is one thing in the
+    interpreter that executes package code without being asked to: a
+    finalizer.  These tests pin the two guards that keep one out of a
+    measurement - the collector is drained before each window and
+    switched off inside it, and a frame named ``__del__`` is never
+    recorded - and pin that neither guard outlives the window.
+    """
+
+    def setUp(self):
+        UniformityTestCase.setUp(self)
+        # for the same reason the probe fixtures make one untraced call:
+        # no one-off cost inside a package function may be charged to
+        # whichever measurement happens to run first
+        numBytes(SAMPLE_INTEGER)
+
+    def test_collector_off_in_window(self):
+        recorder = []
+        collecting = gc.isenabled()
+        steps = trace_line_events(observe_collector, recorder)
+        self.assertEqual(1, len(recorder))
+        self.assertFalse(
+            recorder[0][0],
+            "the collector was running during the measurement, so it "
+            "could have run a finalizer inside it")
+        self.assertEqual(
+            collecting, gc.isenabled(),
+            "the measurement changed whether the collector runs, and left "
+            "it changed for the rest of the suite")
+        self.assertTrue(
+            steps,
+            "no package line events were recorded, so this assertion "
+            "would be vacuous")
+
+    def test_collector_stays_off(self):
+        recorder = []
+        collecting = gc.isenabled()
+        gc.disable()
+        try:
+            trace_line_events(observe_collector, recorder)
+            self.assertFalse(
+                gc.isenabled(),
+                "the measurement switched the collector back on, which "
+                "the caller had deliberately switched off")
+        finally:
+            if collecting:
+                gc.enable()
+        self.assertFalse(recorder[0][0])
+
+    def test_restored_after_failure(self):
+        collecting = gc.isenabled()
+        self.assertRaises(ValueError, trace_line_events,
+                          raise_inside_window, None)
+        self.assertIsNone(
+            sys.gettrace(),
+            "a failure inside the measurement left the tracer installed")
+        self.assertEqual(
+            collecting, gc.isenabled(),
+            "a failure inside the measurement left the collector switched "
+            "off for the rest of the suite")
+
+    def test_garbage_drained_before(self):
+        if not gc.get_threshold()[0]:
+            self.skipTest("automatic collection is switched off, so there "
+                          "is no collection to arm")
+        recorder = []
+        ballast, armed = fill_young_generation()
+        try:
+            trace_line_events(observe_collector, recorder)
+        finally:
+            del ballast[:]
+        observed = recorder[0][1]
+        self.assertTrue(
+            observed * 2 < armed,
+            "%s tracked objects were still waiting to be collected inside "
+            "the measurement against %s just before it, so pending "
+            "finalizers are not being run outside the window"
+            % (observed, armed))
+
+    def test_finalizer_not_recorded(self):
+        recorder = []
+        holder = [make_finalizer_class(recorder)()]
+        clean = trace_line_events(drop_only_reference, [])
+        steps = trace_line_events(drop_only_reference, holder)
+        self.assertEqual(
+            [1], recorder,
+            "the stand-in was not finalized inside the measurement, so "
+            "this assertion would be vacuous")
+        self.assertEqual(
+            [], finalizer_steps(steps),
+            "a finalizer frame was recorded as part of the measurement, "
+            "so a reclaimed object can still be charged to whichever "
+            "probe class happens to release it")
+        self.assertTrue(clean, "nothing was recorded at all")
+        self.assertEqual(
+            clean, steps,
+            "a finalizer running inside the measurement changed the "
+            "recorded sequence")
+
+    def test_pending_cycles_kept_out(self):
+        finalized = []
+        observed = []
+        seed_finalizer_cycles(finalized, FINALIZER_CYCLES)
+        ballast, _ = fill_young_generation()
+        try:
+            steps = trace_line_events(churn_inside_window, observed)
+        finally:
+            del ballast[:]
+        self.assertEqual(
+            [], finalizer_steps(steps),
+            "a collection ran inside the measurement and charged it the "
+            "finalizers of %s cycles left pending before it"
+            % FINALIZER_CYCLES)
+        self.assertFalse(
+            observed[0][0],
+            "the collector was running inside a measurement that had a "
+            "collection armed and the allocations to trip it")
+        self.assertTrue(steps, "nothing was recorded at all")
 
 
 class TestRSADepaddingOperationCount(UniformityTestCase):
@@ -835,6 +1294,29 @@ class TestRSADepaddingOperationCount(UniformityTestCase):
         second = measure(key.decrypt, ciphertexts)
         check_repeatable(self, self.label(KEY_BITS_NARROW, key), first,
                          second)
+
+    def test_uniform_with_finalizers(self):
+        # the invariant end to end under the condition that used to break
+        # it: unreachable cycles carrying a package finalizer waiting to
+        # be collected, and a collection due within the next handful of
+        # allocations, of which de-padding makes thousands.  On an
+        # interpreter that cannot collect a cycle carrying a finalizer at
+        # all this degenerates to a second plain uniformity measurement,
+        # which is harmless.
+        finalized = []
+        key, ciphertexts = probe_suite(KEY_BITS_NARROW)
+        seed_finalizer_cycles(finalized, FINALIZER_CYCLES)
+        ballast, _ = fill_young_generation()
+        try:
+            traces = measure(key.decrypt, ciphertexts)
+        finally:
+            del ballast[:]
+        for name in sorted(traces):
+            self.assertEqual(
+                [], finalizer_steps(traces[name]),
+                "the %s class was charged the finalizers of cycles left "
+                "pending before the measurement" % name)
+        check_uniformity(self, self.label(KEY_BITS_NARROW, key), traces)
 
 
 class TestPremasterSecretOperationCount(UniformityTestCase):

@@ -57,6 +57,26 @@ timing profile may differ on other Python implementations, which our CI does
 not exercise; the functional result is identical on any conforming Python,
 only the timing profile would differ.
 
+Where that residual is easiest to observe has been measured rather than
+guessed, and is named here so that nobody has to hunt for it twice. Testing a
+byte for being non-zero is done by folding its bits together with shifts and
+ors, and CPython takes a slightly cheaper path through those two operations
+when the operand is zero than when it is not, while the symmetric ones (and,
+xor) cost the same whatever they are given. The cost of a fold therefore
+varies a little with how many of the bytes it folds are zero, which is
+secret, wherever such a fold runs on a decrypted block. In practice that
+shows up in the fold of the three rejection conditions that selects the
+premaster secret in the RSA key exchange handler, because that is the place
+with the least other work around it. It measured in the tens of nanoseconds
+per selection on the hardware used here, one-sided but two to three orders of
+magnitude smaller than the differences that were removed, and small enough
+that measurements of the public decryption call, which the modular
+exponentiation dominates, could not resolve it at all. It stays because
+removing it would take either code that is not pure python or a lookup table
+indexed by a secret byte, and such a table trades a timing signal for a
+memory access one, which is not an improvement. So the hardening is a
+reduction of this leak, as far as the language permits, and not its removal.
+
 In other words, pure-python (tlslite-ng internal) implementations of all
 ciphers, as well as all CBC mode ciphers working in MAC-then-encrypt mode are
 **NOT** secure. Don't use them. In addition to that, use AEAD ciphersuites
