@@ -75,11 +75,15 @@ cost multiplied by the number of bytes predicts. The fold of the three
 rejection conditions that selects the premaster secret in the RSA key
 exchange handler is where a single fold is easiest to observe on its own,
 because that is the place with the least other work around it, and it
-measured in the tens of nanoseconds per selection. Both are one-sided but
-two to three orders of magnitude smaller than the differences that were
-removed, and small enough that measurements of the public decryption call,
-which the modular exponentiation dominates, could not resolve either of them
-at all. What varies is how many of the bytes are zero, not whether the zeros
+measured in the tens of nanoseconds per selection. Both are one-sided, and
+both are smaller than the differences that were removed, though by different
+margins: the single fold in the key exchange handler by two to three orders
+of magnitude, and the de-padding aggregate by about one order of magnitude
+for the nearly-all-zero block that maximises it, growing to two or three
+once the block carries the number of zero bytes a real plaintext would.
+Both are small enough that measurements of the public decryption call, which
+the modular exponentiation dominates, could not resolve either of them at
+all. What varies is how many of the bytes are zero, not whether the zeros
 fall in the positions the padding check requires, and at a matched length and
 a matched number of zero bytes no difference between a well formed and a
 malformed block could be resolved here. It stays because removing it would
