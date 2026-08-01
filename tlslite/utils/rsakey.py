@@ -7,8 +7,8 @@ from .cryptomath import *
 from . import tlshashlib as hashlib
 from ..errors import MaskTooLongError, MessageTooLongError, EncodingError, \
     InvalidSignature, UnknownRSAType
-from .constanttime import ct_isnonzero_u32, ct_neq_u32, ct_lsb_prop_u8, \
-    ct_lsb_prop_u16, ct_lt_u32
+from .constanttime import ct_lsb_prop_u8, \
+    ct_lsb_prop_u16, ct_lt_u32, ct_nonzero_u8
 
 
 class RSAKey(object):
@@ -426,17 +426,26 @@ class RSAKey(object):
         Note: as a workaround against Bleichenbacher-like attacks, it will
         return a deterministically selected random message in case the padding
         checks failed. It returns an error (None) only in case the ciphertext
-        is of incorrect length or encodes an integer bigger than the modulus
-        of the key (i.e. it's publically invalid).
+        is of incorrect length or encodes an integer that is not smaller than
+        the modulus of the key (i.e. it's publically invalid).
+
+        Note: de-padding uses fixed public-width loops and masked
+        selection, so Python-level control flow does not depend on padding
+        validity or on the structure of the recovered plaintext.
+        Pure-Python allocation, copying, garbage collection and interpreter
+        effects remain; this is timing hardening, not an absolute
+        constant-time guarantee.
 
         :type encBytes: bytes-like object
         :param encBytes: The value which will be decrypted.
 
         :rtype: bytearray or None
-        :returns: A PKCS#1 v1.5 decryption of the passed-in data or None if
-            the provided data is not properly formatted. Note: encrypting
-            an empty string is correct, so it may return an empty bytearray
-            for some ciphertexts.
+        :returns: A PKCS#1 v1.5 decryption of the passed-in data, or None
+            only when the ciphertext length is incorrect or its encoded
+            integer is not smaller than the modulus. Secret padding errors
+            return a deterministically selected synthetic message instead.
+            Note: encrypting an empty string is correct, so it may return
+            an empty bytearray for some ciphertexts.
         """
         if not self.hasPrivateKey():
             raise AssertionError()
@@ -459,6 +468,11 @@ class RSAKey(object):
         # practice, because of cPython implementation details IT IS NOT
         # see:
         # https://securitypitfalls.wordpress.com/2018/08/03/constant-time-compare-in-python/
+        #
+        # The code below avoids secret-dependent branches, loop counts and
+        # repeated wide-integer work in per-byte validation. Pure-Python
+        # allocation, copying, garbage collection and interpreter effects
+        # remain; this is not an absolute constant-time guarantee.
 
         n = self.n
 
@@ -498,71 +512,99 @@ class RSAKey(object):
                 | len_candidate & mask
 
         synth_msg_start = numBytes(n) - synth_length
+        # Split the offset into bytes so masked selection can stay in the
+        # byte domain.
+        synth_start_hi = synth_msg_start >> 8
+        synth_start_lo = synth_msg_start & 0xff
 
         error_detected = 0
+
+        # secret-dependent checks stay in the byte domain: the 32-bit
+        # zero/inequality helpers and 16-bit mask propagation have
+        # value-dependent allocation costs on CPython. Track offsets as two
+        # bytes and use 8-bit masks; recombine only once when a slice index
+        # is required.
 
         # enumerate over all decrypted bytes
         em_bytes = enumerate(dec_bytes)
         # first check if first two bytes specify PKCS#1 v1.5 encryption padding
         _, val = next(em_bytes)
-        error_detected |= ct_isnonzero_u32(val)
+        error_detected |= ct_nonzero_u8(val)
         _, val = next(em_bytes)
-        error_detected |= ct_neq_u32(val, 0x02)
+        error_detected |= ct_nonzero_u8(val ^ 0x02)
         # then look for for the null separator byte among the padding bytes
         # but inspect all decrypted bytes, even if we already find the
         # separator earlier
-        msg_start = 0
+        msg_start_hi = 0
+        msg_start_lo = 0
+        # track whether a separator has been selected without testing the
+        # secret-derived message offset on every iteration
+        sep_seen = 0
         for pos, val in em_bytes:
+            # pos is public, so ct_lt_u32() is safe here; compute it once
+            # for both checks
+            pos_lt_10 = ct_lt_u32(pos, 10)
+            val_is_zero = 1 ^ ct_nonzero_u8(val)
+
             # padding must be at least 8 bytes long, fail if any of the first
             # 8 bytes of it are zero
             # equivalent to:
             # if pos < 10 and not val:
             #     error_detected = 0x01
-            error_detected |= ct_lt_u32(pos, 10) & (1 ^ ct_isnonzero_u32(val))
+            error_detected |= pos_lt_10 & val_is_zero
 
-            # update the msg_start only once; when it's 0
-            # (pos+1) because we want to skip the null separator
-            # equivalent to:
-            # if pos >= 10 and not msg_start and not val:
+            # Select only the first separator at or after offset 10.
+            # pos + 1 skips the separator:
+            # if pos >= 10 and not sep_seen and not val:
             #     msg_start = pos+1
-            mask = (1 ^ ct_lt_u32(pos, 10)) & (1 ^ ct_isnonzero_u32(val)) \
-                & (1 ^ ct_isnonzero_u32(msg_start))
-            mask = ct_lsb_prop_u16(mask)
-            msg_start = msg_start & (0xffff ^ mask) | (pos+1) & mask
+            #     sep_seen = 1
+            mask = (1 ^ pos_lt_10) & val_is_zero & (1 ^ sep_seen)
+            # update sep_seen after deriving mask so the first separator
+            # remains selectable
+            sep_seen |= mask
+            sep_mask = ct_lsb_prop_u8(mask)
+            # pos is public; split pos+1 before masked selection so the
+            # selected offset stays byte-sized
+            msg_start_hi = msg_start_hi & (0xff ^ sep_mask) \
+                | ((pos+1) >> 8) & sep_mask
+            msg_start_lo = msg_start_lo & (0xff ^ sep_mask) \
+                | ((pos+1) & 0xff) & sep_mask
 
-        # if separator wasn't found, it's an error
-        # equivalent to:
-        # if not msg_start:
-        #     error_detected = 0x01
-        error_detected |= 1 ^ ct_isnonzero_u32(msg_start)
+        error_detected |= 1 ^ sep_seen
 
-        # equivalent to:
+        # the same mask selects the start of the message and the buffer to
+        # return, so propagate the error bit just once
+        mask = ct_lsb_prop_u8(error_detected)
+        not_mask = 0xff ^ mask
+
+        # equivalent to (with the message start seen as one number again):
         # if error_detected:
         #     ret_msg_start = synth_msg_start
         # else:
         #     ret_msg_start = msg_start
-        mask = ct_lsb_prop_u16(error_detected)
-        ret_msg_start = msg_start & (0xffff ^ mask) | synth_msg_start & mask
+        start_hi = msg_start_hi & not_mask | synth_start_hi & mask
+        start_lo = msg_start_lo & not_mask | synth_start_lo & mask
+        # recombine the selected bytes only when the slice index is
+        # required. This one secret-derived wide integer is a remaining
+        # pure-Python timing residual; keeping it out of the per-byte loop
+        # limits value-dependent work.
+        ret_msg_start = (start_hi << 8) | start_lo
 
-        # as at this point the length doesn't leak the information if the
-        # padding was correct or not, we don't have to worry about the
-        # length of the returned value (and thus the size of the buffer we
-        # pass to the caller); but we still need to read both buffers
-        # to ensure that the memory access patern is preserved (that both
-        # buffers are accessed, not just the one we return)
+        # combine both full-width buffers before slicing. Slicing first
+        # would make the masked loop's trip count depend on the selected
+        # message length; combining first keeps it dependent only on the
+        # public modulus width. Reading both buffers also keeps the access
+        # pattern independent of the selected source.
 
         # equivalent to:
         # if error_detected:
         #     return message_random[ret_msg_start:]
         # else:
         #     return dec_bytes[ret_msg_start:]
-        mask = ct_lsb_prop_u8(error_detected)
-        not_mask = 0xff ^ mask
-        ret = bytearray(
-            x & not_mask | y & mask for x, y in
-            zip(dec_bytes[ret_msg_start:], message_random[ret_msg_start:]))
+        combined = bytearray(x & not_mask | y & mask
+                             for x, y in zip(dec_bytes, message_random))
 
-        return ret
+        return combined[ret_msg_start:]
 
     def _rawPrivateKeyOp(self, message):
         raise NotImplementedError()

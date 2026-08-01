@@ -81,6 +81,27 @@ def ct_isnonzero_u32(val):
     return (val|(-val&0xffffffff)) >> 31
 
 
+def ct_nonzero_u8(val):
+    """
+    Return 1 for a non-zero byte, 0 otherwise.
+
+    :type val: int
+    :param val: an unsigned integer representable as an 8 bit value
+    :rtype: int
+
+    The byte-domain fold keeps intermediates within 0-255, avoiding the
+    value-dependent multi-digit allocations caused by the 32-bit
+    masked-negation helpers on CPython. Use ct_nonzero_u8(a ^ b) for byte
+    inequality. The allocation property is CPython-specific; the
+    functional result is portable, and pure Python does not provide an
+    absolute constant-time guarantee.
+    """
+    val |= val >> 4
+    val |= val >> 2
+    val |= val >> 1
+    return val & 1
+
+
 def ct_neq_u32(val_a, val_b):
     """
     Return 1 if val_a != val_b, 0 otherwise. Constant time.
