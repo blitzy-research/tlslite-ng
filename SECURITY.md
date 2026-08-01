@@ -64,18 +64,29 @@ ors, and CPython takes a slightly cheaper path through those two operations
 when the operand is zero than when it is not, while the symmetric ones (and,
 xor) cost the same whatever they are given. The cost of a fold therefore
 varies a little with how many of the bytes it folds are zero, which is
-secret, wherever such a fold runs on a decrypted block. In practice that
-shows up in the fold of the three rejection conditions that selects the
-premaster secret in the RSA key exchange handler, because that is the place
-with the least other work around it. It measured in the tens of nanoseconds
-per selection on the hardware used here, one-sided but two to three orders of
-magnitude smaller than the differences that were removed, and small enough
-that measurements of the public decryption call, which the modular
-exponentiation dominates, could not resolve it at all. It stays because
-removing it would take either code that is not pure python or a lookup table
-indexed by a secret byte, and such a table trades a timing signal for a
-memory access one, which is not an improvement. So the hardening is a
-reduction of this leak, as far as the language permits, and not its removal.
+secret, wherever such a fold runs on a decrypted block. Two places run such
+a fold, and they are worth separating because one is easier to see per fold
+while the other adds up to more. De-padding runs one fold per byte of the
+decrypted block, so the difference accumulates across the whole modulus
+width, and that is where the aggregate is largest: on the hardware used here
+a block whose bytes were nearly all zero de-padded on the order of a
+microsecond faster than one with almost none, which is what the per-fold
+cost multiplied by the number of bytes predicts. The fold of the three
+rejection conditions that selects the premaster secret in the RSA key
+exchange handler is where a single fold is easiest to observe on its own,
+because that is the place with the least other work around it, and it
+measured in the tens of nanoseconds per selection. Both are one-sided but
+two to three orders of magnitude smaller than the differences that were
+removed, and small enough that measurements of the public decryption call,
+which the modular exponentiation dominates, could not resolve either of them
+at all. What varies is how many of the bytes are zero, not whether the zeros
+fall in the positions the padding check requires, and at a matched length and
+a matched number of zero bytes no difference between a well formed and a
+malformed block could be resolved here. It stays because removing it would
+take either code that is not pure python or a lookup table indexed by a
+secret byte, and such a table trades a timing signal for a memory access one,
+which is not an improvement. So the hardening is a reduction of this leak, as
+far as the language permits, and not its removal.
 
 In other words, pure-python (tlslite-ng internal) implementations of all
 ciphers, as well as all CBC mode ciphers working in MAC-then-encrypt mode are
